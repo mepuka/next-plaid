@@ -4,7 +4,9 @@
 import type * as Effect from "effect/Effect";
 
 import type { WorkerRuntimeError } from "../effect/worker-runtime-errors.js";
+import type { MatrixPayload } from "../generated/MatrixPayload.js";
 import type { EncoderIdentity, QueryEmbeddingsPayload } from "../shared/search-contract.js";
+import type { DurableModelAssetStoreKind, ModelAssetStoreKind } from "./model-asset-types.js";
 
 export type BackendKind = "wasm";
 export type EncoderState = "empty" | "initializing" | "ready" | "failed" | "disposed";
@@ -20,6 +22,8 @@ export interface OnnxConfig {
   uses_token_type_ids: boolean;
   mask_token_id: number;
   pad_token_id: number;
+  query_prefix_id?: number;
+  document_prefix_id?: number;
   skiplist_words: string[];
   do_lower_case: boolean;
 }
@@ -49,6 +53,13 @@ export interface EncodedQuery {
   attention_mask: number[];
 }
 
+export interface EncodedDocument {
+  payload: MatrixPayload;
+  timing: EncodeTimingBreakdown;
+  input_ids: number[];
+  attention_mask: number[];
+}
+
 export interface EncoderCreateInput {
   encoder: EncoderIdentity;
   modelUrl: string;
@@ -59,13 +70,39 @@ export interface EncoderCreateInput {
 
 export interface EncoderBackend {
   readonly capabilities: EncoderCapabilities;
-  encode(text: string): Effect.Effect<EncodedQuery, WorkerRuntimeError>;
+  encodeQuery(text: string): Effect.Effect<EncodedQuery, WorkerRuntimeError>;
+  encodeDocument(text: string): Effect.Effect<EncodedDocument, WorkerRuntimeError>;
   health(): Effect.Effect<EncoderHealth, WorkerRuntimeError>;
 }
 
 export type EncoderInitEvent =
-  | { stage: "fetch_start"; url: string; expectedBytes: number | null }
-  | { stage: "fetch_complete"; url: string; bytesReceived: number }
+  | { stage: "asset_memory_hit"; url: string; bytesReceived: number }
+  | {
+      stage: "asset_store_hit";
+      url: string;
+      storeKind: ModelAssetStoreKind;
+      bytesReceived: number;
+    }
+  | {
+      stage: "asset_store_miss";
+      url: string;
+      storeKind: ModelAssetStoreKind;
+    }
+  | { stage: "asset_fetch_start"; url: string; expectedBytes: number | null }
+  | { stage: "asset_fetch_complete"; url: string; bytesReceived: number }
+  | {
+      stage: "asset_store_write_start";
+      url: string;
+      storeKind: DurableModelAssetStoreKind;
+      bytesReceived: number;
+    }
+  | {
+      stage: "asset_store_write_complete";
+      url: string;
+      storeKind: DurableModelAssetStoreKind;
+      bytesReceived: number;
+    }
+  | { stage: "config_validated"; queryLength: number; embeddingDim: number }
   | { stage: "session_create_start" }
   | { stage: "session_create_complete"; durationMs: number }
   | { stage: "warmup_start" }
@@ -91,6 +128,11 @@ export interface EncodeResponse {
   encoded: EncodedQuery;
 }
 
+export interface EncodeDocumentResponse {
+  type: "encoded_document";
+  encoded: EncodedDocument;
+}
+
 export interface EncoderDisposeResponse {
   type: "encoder_disposed";
 }
@@ -100,8 +142,13 @@ export interface EncoderInitRequest {
   payload: EncoderCreateInput;
 }
 
-export interface EncoderEncodeRequest {
-  type: "encode";
+export interface EncoderEncodeQueryRequest {
+  type: "encode_query";
+  payload: { text: string };
+}
+
+export interface EncoderEncodeDocumentRequest {
+  type: "encode_document";
   payload: { text: string };
 }
 
@@ -115,7 +162,8 @@ export interface EncoderDisposeRequest {
 
 export type EncoderWorkerRequest =
   | EncoderInitRequest
-  | EncoderEncodeRequest
+  | EncoderEncodeQueryRequest
+  | EncoderEncodeDocumentRequest
   | EncoderHealthRequest
   | EncoderDisposeRequest;
 
@@ -123,4 +171,5 @@ export type EncoderWorkerResponse =
   | EncoderInitResponse
   | EncoderHealthResponse
   | EncodeResponse
+  | EncodeDocumentResponse
   | EncoderDisposeResponse;

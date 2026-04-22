@@ -13,19 +13,27 @@ import {
 import * as Worker from "effect/unstable/workers/Worker";
 
 import type {
+  EncodedDocument,
   EncodedQuery,
   EncoderCapabilities,
   EncoderCreateInput,
   EncoderInitEvent,
+  EncodeDocumentResponse,
   EncoderInitResponse,
   EncodeResponse,
   EncoderWorkerRequest,
 } from "../model-worker/types.js";
 import {
+  decodeEncodeDocumentResponseSchema,
   decodeEncodeResponseSchema,
   decodeEncoderInitEventSchema,
   decodeEncoderInitResponseSchema,
 } from "../model-worker/encoder-contract.js";
+import {
+  decodeEncoderQueryCacheKey,
+  encodeEncoderInitBindingKey,
+  encodeEncoderQueryCacheKey,
+} from "./encoder-worker-client-schema.js";
 import {
   type EncoderClientError,
   permanentClientError,
@@ -51,9 +59,12 @@ export interface EncoderWorkerClientApi {
   readonly init: (
     input: EncoderCreateInput,
   ) => Effect.Effect<EncoderCapabilities, EncoderClientError>;
-  readonly encode: (
+  readonly encodeQuery: (
     args: { text: string; requestId?: string },
   ) => Effect.Effect<EncodedQuery, EncoderClientError>;
+  readonly encodeDocument: (
+    args: { text: string; requestId?: string },
+  ) => Effect.Effect<EncodedDocument, EncoderClientError>;
 }
 
 export class EncoderWorkerClient
@@ -98,44 +109,11 @@ const emptyLifecycleControl: EncoderLifecycleControl = {
   readyGate: null,
 };
 
-function encoderInputKey(input: EncoderCreateInput): string {
-  return JSON.stringify({
-    encoder: input.encoder,
-    modelUrl: input.modelUrl,
-    onnxConfigUrl: input.onnxConfigUrl,
-    tokenizerUrl: input.tokenizerUrl,
-    prefer: input.prefer ?? null,
-  });
-}
-
 function publishEvent(
   pubsub: PubSub.PubSub<EncoderLifecycleEvent>,
   event: EncoderLifecycleEvent,
 ): Effect.Effect<void> {
   return PubSub.publish(pubsub, event).pipe(Effect.asVoid);
-}
-
-function encoderQueryCacheKey(
-  capabilities: EncoderCapabilities,
-  text: string,
-): string {
-  return JSON.stringify({
-    encoderId: capabilities.encoderId,
-    encoderBuild: capabilities.encoderBuild,
-    text,
-  });
-}
-
-function decodeEncoderQueryCacheKey(
-  key: string,
-): { readonly text: string } {
-  const parsed = JSON.parse(key) as { readonly text?: unknown };
-  if (typeof parsed.text !== "string") {
-    throw new Error("invalid encoder cache key");
-  }
-  return {
-    text: parsed.text,
-  };
 }
 
 function disposedEncoderError(operation: string): EncoderClientError {
@@ -170,7 +148,22 @@ function decodeEncodedResponse(
       permanentClientError({
         cause: "decode_failed",
         message: `failed to decode encoder encode response: ${String(error)}`,
-        operation: "encoder_worker.encode",
+        operation: "encoder_worker.encode_query",
+        details: error,
+      }),
+    ),
+  );
+}
+
+function decodeEncodedDocumentResponse(
+  value: unknown,
+): Effect.Effect<EncodeDocumentResponse, EncoderClientError> {
+  return decodeEncodeDocumentResponseSchema(value).pipe(
+    Effect.mapError((error) =>
+      permanentClientError({
+        cause: "decode_failed",
+        message: `failed to decode encoder document response: ${String(error)}`,
+        operation: "encoder_worker.encode_document",
         details: error,
       }),
     ),
@@ -208,7 +201,9 @@ export const makeEncoderWorkerClient = (
         lastError: null,
       });
       const eventPubSub = yield* PubSub.unbounded<EncoderLifecycleEvent>({
-        replay: 16,
+        // Init now emits more asset lifecycle events, so keep enough replay
+        // headroom for late subscribers to observe a full init sequence.
+        replay: 32,
       });
       const controlState = yield* SynchronizedRef.make<EncoderLifecycleControl>(
         emptyLifecycleControl,
@@ -243,7 +238,7 @@ export const makeEncoderWorkerClient = (
               permanentClientError({
                 cause: "encoder_not_initialized",
                 message: "encoder has not been initialized",
-                operation: "encoder_worker.encode",
+                operation: "encoder_worker.encode_query",
                 details: null,
               }),
             )
@@ -319,29 +314,27 @@ export const makeEncoderWorkerClient = (
         "EncoderWorkerClient.requestEncodedQuery",
       )(
         (cacheKey: string) =>
-          Effect.gen(function*() {
-            const { text } = yield* Effect.try({
-              try: () => decodeEncoderQueryCacheKey(cacheKey),
-              catch: (error) =>
+          decodeEncoderQueryCacheKey(cacheKey).pipe(
+            Effect.mapError((error) =>
                 permanentClientError({
                   cause: "invalid_cache_key",
                   message: "failed to decode encoder query cache key",
-                  operation: "encoder_worker.encode",
+                  operation: "encoder_worker.encode_query",
                   details: error,
                 }),
-            });
-
-            const response = yield* transport.request(
-              { type: "encode", payload: { text } },
-              {
-                operation: "encoder_worker.encode",
-                requestType: "encode",
-                decodeResponse: decodeEncodedResponse,
-              },
-            );
-
-            return response.encoded;
-          }),
+            ),
+            Effect.flatMap(({ text }) =>
+              transport.request(
+                { type: "encode_query", payload: { text } },
+                {
+                  operation: "encoder_worker.encode_query",
+                  requestType: "encode_query",
+                  decodeResponse: decodeEncodedResponse,
+                },
+              )
+            ),
+            Effect.map((response) => response.encoded),
+          ),
       );
 
       const encoderCacheContext = yield* Layer.buildWithScope(
@@ -377,7 +370,16 @@ export const makeEncoderWorkerClient = (
       const init = Effect.fn("EncoderWorkerClient.init")(
         (input: EncoderCreateInput) =>
           Effect.gen(function*() {
-            const requestedKey = encoderInputKey(input);
+            const requestedKey = yield* encodeEncoderInitBindingKey(input).pipe(
+              Effect.mapError((error) =>
+                permanentClientError({
+                  cause: "invalid_init_key",
+                  message: "failed to encode encoder init binding key",
+                  operation: "encoder_worker.init",
+                  details: error,
+                })
+              ),
+            );
             const control: EncoderInitControl = yield* SynchronizedRef.modifyEffect(
               controlState,
               (
@@ -496,7 +498,7 @@ export const makeEncoderWorkerClient = (
           }),
       );
 
-      const encode = Effect.fn("EncoderWorkerClient.encode")(
+      const encodeQuery = Effect.fn("EncoderWorkerClient.encodeQuery")(
         ({ text, requestId }: { text: string; requestId?: string }) =>
           Effect.gen(function*() {
             const snapshot = yield* SubscriptionRef.get(state);
@@ -504,12 +506,12 @@ export const makeEncoderWorkerClient = (
               return yield* permanentClientError({
                 cause: "encoder_not_initialized",
                 message: "encoder has not been initialized",
-                operation: "encoder_worker.encode",
+                operation: "encoder_worker.encode_query",
                 details: null,
               });
             }
             if (snapshot.status === "disposed") {
-              return yield* disposedEncoderError("encoder_worker.encode");
+              return yield* disposedEncoderError("encoder_worker.encode_query");
             }
             if (snapshot.status === "failed") {
               return yield* snapshot.lastError;
@@ -520,7 +522,7 @@ export const makeEncoderWorkerClient = (
             const readySnapshot = yield* SubscriptionRef.get(state);
             const logAnnotations: Record<string, string | number> = {
               worker_kind: "encoder",
-              operation: "encoder_worker.encode",
+              operation: "encoder_worker.encode_query",
               query_char_len: text.length,
             };
             if (requestId !== undefined) {
@@ -530,30 +532,40 @@ export const makeEncoderWorkerClient = (
               logAnnotations.encoder_id = readySnapshot.capabilities.encoderId;
             }
 
+            if (readySnapshot.status !== "ready") {
+              return yield* permanentClientError({
+                cause: "encoder_not_initialized",
+                message: "encoder is not ready",
+                operation: "encoder_worker.encode_query",
+                details: { state: readySnapshot.status },
+              });
+            }
+
+            const readyCapabilities = readySnapshot.capabilities;
             const handleEncodeError = (error: EncoderClientError) =>
               encoderCache.clear().pipe(
                 Effect.andThen(
                   failEncoder(
-                    "encoder_worker.encode",
+                    "encoder_worker.encode_query",
                     error,
-                    snapshot.status === "ready" ? snapshot.capabilities : null,
+                    readyCapabilities,
                   ),
                 ),
                 Effect.andThen(Effect.fail(error)),
               );
 
-            if (readySnapshot.status !== "ready") {
-              return yield* permanentClientError({
-                cause: "encoder_not_initialized",
-                message: "encoder is not ready",
-                operation: "encoder_worker.encode",
-                details: { state: readySnapshot.status },
-              });
-            }
-
-            const cacheKey = encoderQueryCacheKey(
-              readySnapshot.capabilities,
+            const cacheKey = yield* encodeEncoderQueryCacheKey(
+              readyCapabilities,
               text,
+            ).pipe(
+              Effect.mapError((error) =>
+                permanentClientError({
+                  cause: "invalid_cache_key",
+                  message: "failed to encode encoder query cache key",
+                  operation: "encoder_worker.encode_query",
+                  details: error,
+                })
+              ),
             );
 
             const encoded = yield* encoderCache.get(cacheKey).pipe(
@@ -562,7 +574,7 @@ export const makeEncoderWorkerClient = (
                 PermanentClientError: handleEncodeError,
                 DegradedClientError: handleEncodeError,
               }),
-              Effect.withLogSpan("encoder_worker.encode"),
+              Effect.withLogSpan("encoder_worker.encode_query"),
               Effect.annotateLogs(logAnnotations),
             );
 
@@ -570,11 +582,86 @@ export const makeEncoderWorkerClient = (
           }),
       );
 
+      const encodeDocument = Effect.fn("EncoderWorkerClient.encodeDocument")(
+        ({ text, requestId }: { text: string; requestId?: string }) =>
+          Effect.gen(function*() {
+            const snapshot = yield* SubscriptionRef.get(state);
+            if (snapshot.status === "empty") {
+              return yield* permanentClientError({
+                cause: "encoder_not_initialized",
+                message: "encoder has not been initialized",
+                operation: "encoder_worker.encode_document",
+                details: null,
+              });
+            }
+            if (snapshot.status === "disposed") {
+              return yield* disposedEncoderError("encoder_worker.encode_document");
+            }
+            if (snapshot.status === "failed") {
+              return yield* snapshot.lastError;
+            }
+
+            const readyGate = yield* getReadyGate();
+            yield* Deferred.await(readyGate);
+            const readySnapshot = yield* SubscriptionRef.get(state);
+            const logAnnotations: Record<string, string | number> = {
+              worker_kind: "encoder",
+              operation: "encoder_worker.encode_document",
+              document_char_len: text.length,
+            };
+            if (requestId !== undefined) {
+              logAnnotations.request_id = requestId;
+            }
+            if (readySnapshot.status === "ready") {
+              logAnnotations.encoder_id = readySnapshot.capabilities.encoderId;
+            }
+
+            if (readySnapshot.status !== "ready") {
+              return yield* permanentClientError({
+                cause: "encoder_not_initialized",
+                message: "encoder is not ready",
+                operation: "encoder_worker.encode_document",
+                details: { state: readySnapshot.status },
+              });
+            }
+
+            const readyCapabilities = readySnapshot.capabilities;
+            const handleEncodeError = (error: EncoderClientError) =>
+              failEncoder(
+                "encoder_worker.encode_document",
+                error,
+                readyCapabilities,
+              ).pipe(
+                Effect.andThen(Effect.fail(error)),
+              );
+
+            const response = yield* transport.request(
+              { type: "encode_document", payload: { text } },
+              {
+                operation: "encoder_worker.encode_document",
+                requestType: "encode_document",
+                decodeResponse: decodeEncodedDocumentResponse,
+              },
+            ).pipe(
+              Effect.catchTags({
+                TransientClientError: handleEncodeError,
+                PermanentClientError: handleEncodeError,
+                DegradedClientError: handleEncodeError,
+              }),
+              Effect.withLogSpan("encoder_worker.encode_document"),
+              Effect.annotateLogs(logAnnotations),
+            );
+
+            return response.encoded;
+          }),
+      );
+
       return {
         state,
         events: Stream.fromPubSub(eventPubSub),
         init,
-        encode,
+        encodeQuery,
+        encodeDocument,
       } satisfies EncoderWorkerClientApi;
     }),
     "encoder_worker.client",

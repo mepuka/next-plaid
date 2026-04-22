@@ -1,4 +1,3 @@
-import * as BrowserWorker from "@effect/platform-browser/BrowserWorker";
 import {
   Layer,
   ManagedRuntime,
@@ -10,14 +9,18 @@ import type {
   SearchClientError,
 } from "./client-errors.js";
 import { BrowserSearchRuntime } from "./browser-search-runtime.js";
+import { DocumentEmbeddingCacheService } from "./document-embedding-cache-service.js";
+import { DocumentTextDigestService } from "./document-text-digest-service.js";
 import {
   EncoderWorkerClient,
   type EncoderWorkerClientOptions,
 } from "./encoder-worker-client.js";
+import { SearchMetadataCatalog } from "./search-metadata-catalog.js";
 import {
   SearchWorkerClient,
   type SearchWorkerClientOptions,
 } from "./search-worker-client.js";
+import * as BrowserWorker from "./browser-worker.js";
 
 export type BrowserRuntimeAppServices =
   | SearchWorkerClient
@@ -44,9 +47,31 @@ export interface BrowserRuntimeWorkerLayers {
   >;
 }
 
+export interface BrowserSearchRuntimeOptions {
+  readonly documentCacheCapacity?: number | undefined;
+}
+
 export interface BrowserRuntimeCompositionOptions extends BrowserRuntimeWorkerLayers {
   readonly searchClientOptions?: SearchWorkerClientOptions | undefined;
   readonly encoderClientOptions?: EncoderWorkerClientOptions | undefined;
+  readonly runtimeOptions?: BrowserSearchRuntimeOptions | undefined;
+}
+
+function makeBrowserWorkerClientLayerWithCatalog(
+  options: BrowserRuntimeCompositionOptions,
+  metadataCatalogLayer: Layer.Layer<SearchMetadataCatalog, never>,
+): Layer.Layer<
+  SearchWorkerClient | EncoderWorkerClient,
+  BrowserRuntimeAppError
+> {
+  const searchClientLayer = SearchWorkerClient.layer(options.searchClientOptions).pipe(
+    Layer.provide(Layer.mergeAll(options.searchWorkerLayer, metadataCatalogLayer)),
+  );
+  const encoderClientLayer = EncoderWorkerClient.layer(options.encoderClientOptions).pipe(
+    Layer.provide(options.encoderWorkerLayer),
+  );
+
+  return Layer.mergeAll(searchClientLayer, encoderClientLayer);
 }
 
 export function makeBrowserRuntimeWorkerLayers(
@@ -64,14 +89,10 @@ export function makeBrowserWorkerClientLayer(
   SearchWorkerClient | EncoderWorkerClient,
   BrowserRuntimeAppError
 > {
-  const searchClientLayer = SearchWorkerClient.layer(options.searchClientOptions).pipe(
-    Layer.provide(options.searchWorkerLayer),
+  return makeBrowserWorkerClientLayerWithCatalog(
+    options,
+    SearchMetadataCatalog.layer,
   );
-  const encoderClientLayer = EncoderWorkerClient.layer(options.encoderClientOptions).pipe(
-    Layer.provide(options.encoderWorkerLayer),
-  );
-
-  return Layer.mergeAll(searchClientLayer, encoderClientLayer);
 }
 
 export function makeBrowserSearchRuntimeLayer(
@@ -80,9 +101,25 @@ export function makeBrowserSearchRuntimeLayer(
   BrowserRuntimeAppServices,
   BrowserRuntimeAppError
 > {
-  const workerClientLayer = makeBrowserWorkerClientLayer(options);
+  const metadataCatalogLayer = SearchMetadataCatalog.layer;
+  const workerClientLayer = makeBrowserWorkerClientLayerWithCatalog(
+    options,
+    metadataCatalogLayer,
+  );
+  const documentTextDigestLayer = DocumentTextDigestService.layer;
+  const documentEmbeddingCacheLayer = DocumentEmbeddingCacheService.layer({
+    capacity: options.runtimeOptions?.documentCacheCapacity,
+  }).pipe(
+    Layer.provide(Layer.mergeAll(workerClientLayer, documentTextDigestLayer)),
+  );
   const runtimeLayer = BrowserSearchRuntime.layer().pipe(
-    Layer.provide(workerClientLayer),
+    Layer.provide(
+      Layer.mergeAll(
+        workerClientLayer,
+        metadataCatalogLayer,
+        documentEmbeddingCacheLayer,
+      ),
+    ),
   );
 
   return Layer.mergeAll(workerClientLayer, runtimeLayer);
@@ -101,6 +138,7 @@ export function makeBrowserSearchRuntimeManagedRuntimeFromFactories(
   options: BrowserWorkerFactories & {
     readonly searchClientOptions?: SearchWorkerClientOptions | undefined;
     readonly encoderClientOptions?: EncoderWorkerClientOptions | undefined;
+    readonly runtimeOptions?: BrowserSearchRuntimeOptions | undefined;
   },
 ): ManagedRuntime.ManagedRuntime<
   BrowserRuntimeAppServices,
@@ -110,5 +148,6 @@ export function makeBrowserSearchRuntimeManagedRuntimeFromFactories(
     ...makeBrowserRuntimeWorkerLayers(options),
     searchClientOptions: options.searchClientOptions,
     encoderClientOptions: options.encoderClientOptions,
+    runtimeOptions: options.runtimeOptions,
   });
 }

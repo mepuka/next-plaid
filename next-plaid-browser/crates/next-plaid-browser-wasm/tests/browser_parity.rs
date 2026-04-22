@@ -10,18 +10,25 @@ use js_sys::{Function, Object, Promise, Reflect};
 use next_plaid_browser_contract::{
     ArtifactEntry, ArtifactKind, BundleArtifactBytesPayload, BundleManifest, CompressionKind,
     EmbeddingDtype, EmbeddingLayout, EncoderIdentity, ErrorCode, FtsTokenizer, FusionMode,
-    HealthResponse, InstallBundleRequest, LoadStoredBundleRequest, MatrixPayload, MetadataMode,
-    QueryEmbeddingsPayload, QueryResultResponse, RuntimeRequest, RuntimeResponse,
-    SearchIndexPayload, SearchParamsRequest, SearchRequest, SearchResponse, StorageErrorResponse,
-    StorageRequest, StorageResponse, WorkerLoadIndexRequest, WorkerSearchRequest,
-    RUNTIME_SCHEMA_VERSION, SUPPORTED_BUNDLE_FORMAT_VERSION,
+    HealthResponse, InstallBundleRequest, LoadMutableCorpusRequest, LoadStoredBundleRequest,
+    MatrixPayload, MetadataMode, MutableCorpusDocument, MutableCorpusSnapshot,
+    QueryEmbeddingsPayload, QueryResultResponse, RegisterMutableCorpusRequest, RuntimeRequest,
+    RuntimeResponse, SearchIndexPayload, SearchParamsRequest, SearchRequest, SearchResponse,
+    StorageErrorResponse, StorageRequest, StorageResponse, SyncMutableCorpusRequest,
+    WorkerLoadIndexRequest, WorkerSearchRequest, RUNTIME_SCHEMA_VERSION,
+    SUPPORTED_BUNDLE_FORMAT_VERSION,
 };
-use next_plaid_browser_kernel::{search_one, BrowserIndexView, MatrixView, SearchParameters};
+use next_plaid_browser_kernel::{
+    maxsim_score, search_one, BrowserIndexView, MatrixView, SearchParameters,
+};
+use next_plaid_browser_storage::{
+    load_mutable_corpus, register_mutable_corpus, sync_mutable_corpus, BrowserStorageError,
+};
 use next_plaid_browser_wasm::{
     handle_runtime_request_json, handle_storage_request_json, reset_runtime_state,
 };
 use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen_futures::{future_to_promise, JsFuture};
 use wasm_bindgen_test::*;
 
 const DEFAULT_BATCH_SIZE: usize = 2000;
@@ -334,6 +341,80 @@ fn direct_kernel_result(request: &WorkerSearchRequest) -> SearchResponse {
     }
 }
 
+fn direct_mutable_semantic_result(
+    snapshot: &MutableCorpusSnapshot,
+    request: &WorkerSearchRequest,
+) -> SearchResponse {
+    let top_k = request.request.params.top_k.unwrap_or(10);
+    let candidate_ids = match request.request.subset.as_deref() {
+        Some(subset) => {
+            let mut ids: Vec<usize> = subset
+                .iter()
+                .filter_map(|document_id| usize::try_from(*document_id).ok())
+                .filter(|document_id| *document_id < snapshot.documents.len())
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        }
+        None => (0..snapshot.documents.len()).collect(),
+    };
+
+    let results = request
+        .request
+        .queries
+        .as_ref()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(query_id, query_payload)| {
+            let embeddings = query_payload.embeddings.as_ref().unwrap();
+            let rows = embeddings.len();
+            let dim = embeddings[0].len();
+            let flat: Vec<f32> = embeddings.iter().flatten().copied().collect();
+            let query = MatrixView::new(&flat, rows, dim).unwrap();
+
+            let mut ranked = candidate_ids
+                .iter()
+                .filter_map(|document_id| {
+                    let document = snapshot.documents.get(*document_id)?;
+                    let semantic_embeddings = document.semantic_embeddings.as_ref()?;
+                    let matrix = MatrixView::new(
+                        &semantic_embeddings.values,
+                        semantic_embeddings.rows,
+                        semantic_embeddings.dim,
+                    )
+                    .unwrap();
+                    Some((*document_id as i64, maxsim_score(query, matrix)))
+                })
+                .collect::<Vec<_>>();
+            ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
+            ranked.truncate(top_k);
+
+            QueryResultResponse {
+                query_id,
+                document_ids: ranked.iter().map(|(document_id, _)| *document_id).collect(),
+                scores: ranked.iter().map(|(_, score)| *score).collect(),
+                metadata: ranked
+                    .iter()
+                    .map(|(document_id, _)| {
+                        usize::try_from(*document_id)
+                            .ok()
+                            .and_then(|index| snapshot.documents.get(index))
+                            .and_then(|document| document.metadata.clone())
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+
+    SearchResponse {
+        num_queries: request.request.queries.as_ref().unwrap().len(),
+        results,
+        timing: None,
+    }
+}
+
 fn runtime_result(request: &WorkerSearchRequest) -> SearchResponse {
     let request_json = serde_json::to_string(&RuntimeRequest::Search(request.clone())).unwrap();
     let response_json = handle_runtime_request_json(&request_json).unwrap();
@@ -460,6 +541,263 @@ fn storage_load_request(index_id: &str, name: &str) -> StorageRequest {
         name: name.into(),
         fts_tokenizer: FtsTokenizer::Unicode61,
     })
+}
+
+fn register_mutable_corpus_request(corpus_id: &str, dim: usize) -> StorageRequest {
+    register_mutable_corpus_request_with_tokenizer(corpus_id, dim, FtsTokenizer::Unicode61)
+}
+
+fn register_mutable_corpus_request_with_tokenizer(
+    corpus_id: &str,
+    dim: usize,
+    fts_tokenizer: FtsTokenizer,
+) -> StorageRequest {
+    StorageRequest::RegisterMutableCorpus(RegisterMutableCorpusRequest {
+        corpus_id: corpus_id.into(),
+        encoder: encoder(dim),
+        fts_tokenizer,
+    })
+}
+
+fn sync_mutable_corpus_request(corpus_id: &str, snapshot: MutableCorpusSnapshot) -> StorageRequest {
+    StorageRequest::SyncMutableCorpus(SyncMutableCorpusRequest {
+        corpus_id: corpus_id.into(),
+        snapshot,
+    })
+}
+
+fn load_mutable_corpus_request(corpus_id: &str) -> StorageRequest {
+    StorageRequest::LoadMutableCorpus(LoadMutableCorpusRequest {
+        corpus_id: corpus_id.into(),
+    })
+}
+
+fn matrix_payload(values: Vec<f32>, rows: usize, dim: usize) -> MatrixPayload {
+    MatrixPayload { values, rows, dim }
+}
+
+fn mutable_snapshot_v1() -> MutableCorpusSnapshot {
+    MutableCorpusSnapshot {
+        documents: vec![
+            MutableCorpusDocument {
+                document_id: "doc-alpha".into(),
+                semantic_text: "alpha launch semantic body".into(),
+                semantic_embeddings: None,
+                metadata: Some(serde_json::json!({
+                    "title": "alpha launch memo",
+                    "topic": "edge",
+                    "kind": "memo"
+                })),
+            },
+            MutableCorpusDocument {
+                document_id: "doc-beta".into(),
+                semantic_text: "beta report semantic body".into(),
+                semantic_embeddings: None,
+                metadata: Some(serde_json::json!({
+                    "title": "beta report summary",
+                    "topic": "metrics",
+                    "kind": "report"
+                })),
+            },
+        ],
+    }
+}
+
+fn mutable_snapshot_v2() -> MutableCorpusSnapshot {
+    MutableCorpusSnapshot {
+        documents: vec![
+            MutableCorpusDocument {
+                document_id: "doc-alpha".into(),
+                semantic_text: "alpha launch semantic body updated".into(),
+                semantic_embeddings: None,
+                metadata: Some(serde_json::json!({
+                    "title": "alpha launch memo v2",
+                    "topic": "edge",
+                    "kind": "memo"
+                })),
+            },
+            MutableCorpusDocument {
+                document_id: "doc-gamma".into(),
+                semantic_text: "gamma archive semantic body".into(),
+                semantic_embeddings: None,
+                metadata: Some(serde_json::json!({
+                    "title": "gamma archive note",
+                    "topic": "history",
+                    "kind": "archive"
+                })),
+            },
+        ],
+    }
+}
+
+fn mutable_snapshot_v1_dense() -> MutableCorpusSnapshot {
+    MutableCorpusSnapshot {
+        documents: vec![
+            MutableCorpusDocument {
+                document_id: "doc-alpha".into(),
+                semantic_text: "alpha launch semantic body".into(),
+                semantic_embeddings: Some(matrix_payload(
+                    vec![
+                        1.0, 0.0, //
+                        0.7, 0.7,
+                    ],
+                    2,
+                    2,
+                )),
+                metadata: Some(serde_json::json!({
+                    "title": "alpha launch memo",
+                    "topic": "edge",
+                    "kind": "memo"
+                })),
+            },
+            MutableCorpusDocument {
+                document_id: "doc-beta".into(),
+                semantic_text: "beta report semantic body".into(),
+                semantic_embeddings: Some(matrix_payload(
+                    vec![
+                        0.0, 1.0, //
+                        0.7, 0.7,
+                    ],
+                    2,
+                    2,
+                )),
+                metadata: Some(serde_json::json!({
+                    "title": "beta report summary",
+                    "topic": "metrics",
+                    "kind": "report"
+                })),
+            },
+        ],
+    }
+}
+
+fn mutable_snapshot_v1_dense_embedding_update() -> MutableCorpusSnapshot {
+    MutableCorpusSnapshot {
+        documents: vec![
+            MutableCorpusDocument {
+                document_id: "doc-alpha".into(),
+                semantic_text: "alpha launch semantic body".into(),
+                semantic_embeddings: Some(matrix_payload(
+                    vec![
+                        0.2, 0.98, //
+                        0.7, 0.7,
+                    ],
+                    2,
+                    2,
+                )),
+                metadata: Some(serde_json::json!({
+                    "title": "alpha launch memo",
+                    "topic": "edge",
+                    "kind": "memo"
+                })),
+            },
+            MutableCorpusDocument {
+                document_id: "doc-beta".into(),
+                semantic_text: "beta report semantic body".into(),
+                semantic_embeddings: Some(matrix_payload(
+                    vec![
+                        0.0, 1.0, //
+                        0.7, 0.7,
+                    ],
+                    2,
+                    2,
+                )),
+                metadata: Some(serde_json::json!({
+                    "title": "beta report summary",
+                    "topic": "metrics",
+                    "kind": "report"
+                })),
+            },
+        ],
+    }
+}
+
+fn mutable_snapshot_partial_dense() -> MutableCorpusSnapshot {
+    MutableCorpusSnapshot {
+        documents: vec![
+            MutableCorpusDocument {
+                document_id: "doc-alpha".into(),
+                semantic_text: "alpha launch semantic body".into(),
+                semantic_embeddings: Some(matrix_payload(
+                    vec![
+                        1.0, 0.0, //
+                        0.7, 0.7,
+                    ],
+                    2,
+                    2,
+                )),
+                metadata: Some(serde_json::json!({
+                    "title": "alpha launch memo",
+                    "topic": "edge",
+                    "kind": "memo"
+                })),
+            },
+            MutableCorpusDocument {
+                document_id: "doc-beta".into(),
+                semantic_text: "beta report semantic body".into(),
+                semantic_embeddings: None,
+                metadata: Some(serde_json::json!({
+                    "title": "beta report summary",
+                    "topic": "metrics",
+                    "kind": "report"
+                })),
+            },
+        ],
+    }
+}
+
+fn mutable_snapshot_dense_dim_mismatch() -> MutableCorpusSnapshot {
+    MutableCorpusSnapshot {
+        documents: vec![
+            MutableCorpusDocument {
+                document_id: "doc-alpha".into(),
+                semantic_text: "alpha launch semantic body".into(),
+                semantic_embeddings: Some(matrix_payload(vec![1.0, 0.0, 0.7, 0.7], 1, 4)),
+                metadata: Some(serde_json::json!({
+                    "title": "alpha launch memo",
+                    "topic": "edge",
+                    "kind": "memo"
+                })),
+            },
+            MutableCorpusDocument {
+                document_id: "doc-beta".into(),
+                semantic_text: "beta report semantic body".into(),
+                semantic_embeddings: Some(matrix_payload(vec![0.0, 1.0, 0.7, 0.7], 1, 4)),
+                metadata: Some(serde_json::json!({
+                    "title": "beta report summary",
+                    "topic": "metrics",
+                    "kind": "report"
+                })),
+            },
+        ],
+    }
+}
+
+fn mutable_snapshot_dense_value_length_mismatch() -> MutableCorpusSnapshot {
+    MutableCorpusSnapshot {
+        documents: vec![
+            MutableCorpusDocument {
+                document_id: "doc-alpha".into(),
+                semantic_text: "alpha launch semantic body".into(),
+                semantic_embeddings: Some(matrix_payload(vec![1.0, 0.0, 0.7], 2, 2)),
+                metadata: Some(serde_json::json!({
+                    "title": "alpha launch memo",
+                    "topic": "edge",
+                    "kind": "memo"
+                })),
+            },
+            MutableCorpusDocument {
+                document_id: "doc-beta".into(),
+                semantic_text: "beta report semantic body".into(),
+                semantic_embeddings: Some(matrix_payload(vec![0.0, 1.0, 0.7, 0.7], 2, 2)),
+                metadata: Some(serde_json::json!({
+                    "title": "beta report summary",
+                    "topic": "metrics",
+                    "kind": "report"
+                })),
+            },
+        ],
+    }
 }
 
 fn sqlite_sidecar_storage_install_request(index_id: &str, build_id: &str) -> StorageRequest {
@@ -639,6 +977,10 @@ async fn await_promise(value: JsValue) -> JsValue {
 async fn try_await_promise(value: JsValue) -> Result<JsValue, JsValue> {
     let promise = value.dyn_into::<Promise>().unwrap();
     JsFuture::from(promise).await
+}
+
+async fn next_microtask() {
+    let _ = await_promise(Promise::resolve(&JsValue::UNDEFINED).into()).await;
 }
 
 fn call_method0(target: &JsValue, name: &str) -> JsValue {
@@ -851,6 +1193,470 @@ async fn browser_storage_install_and_reload_roundtrip() {
             + health.memory_usage_breakdown.metadata_json_bytes
             + health.memory_usage_breakdown.keyword_runtime_bytes
     );
+}
+
+#[wasm_bindgen_test]
+async fn browser_storage_mutable_corpus_register_sync_reload_roundtrip() {
+    reset_runtime_state();
+    let corpus_id = "mutable-demo-roundtrip";
+
+    let register = storage_response(register_mutable_corpus_request(corpus_id, 2)).await;
+    match register {
+        StorageResponse::MutableCorpusRegistered(result) => {
+            assert_eq!(result.corpus_id, corpus_id);
+            assert!(result.created);
+            assert_eq!(result.summary.document_count, 0);
+            assert!(result.summary.has_keyword_state);
+            assert!(!result.summary.has_dense_state);
+        }
+        other => panic!("unexpected storage response: {other:?}"),
+    }
+
+    let sync = storage_response(sync_mutable_corpus_request(
+        corpus_id,
+        mutable_snapshot_v1_dense(),
+    ))
+    .await;
+    match sync {
+        StorageResponse::MutableCorpusSynced(result) => {
+            assert_eq!(result.corpus_id, corpus_id);
+            assert_eq!(result.summary.document_count, 2);
+            assert!(result.summary.has_dense_state);
+            assert!(result.sync.changed);
+            assert_eq!(result.sync.added, 2);
+            assert_eq!(result.sync.updated, 0);
+            assert_eq!(result.sync.deleted, 0);
+            assert_eq!(result.sync.unchanged, 0);
+        }
+        other => panic!("unexpected storage response: {other:?}"),
+    }
+
+    let keyword = runtime_result(&keyword_search_request(corpus_id, &["alpha"]));
+    assert_eq!(keyword.results[0].document_ids, vec![0]);
+    assert_eq!(
+        keyword.results[0].metadata[0]
+            .as_ref()
+            .and_then(|value| value.get("title"))
+            .and_then(|value| value.as_str()),
+        Some("alpha launch memo")
+    );
+    let semantic_before_reload = runtime_result(&worker_search_request(
+        corpus_id,
+        vec![vec![vec![1.0, 0.0], vec![0.7, 0.7]]],
+        None,
+    ));
+    assert_eq!(semantic_before_reload.results[0].document_ids, vec![0, 1]);
+    let hybrid_before_reload = runtime_result(&hybrid_search_request(corpus_id));
+    assert_eq!(hybrid_before_reload.results[0].document_ids[0], 1);
+
+    reset_runtime_state();
+    let reload_required = runtime_error_response(RuntimeRequest::Search(keyword_search_request(
+        corpus_id,
+        &["alpha"],
+    )));
+    assert_eq!(reload_required.code, ErrorCode::IndexNotLoaded);
+
+    let load = storage_response(load_mutable_corpus_request(corpus_id)).await;
+    match load {
+        StorageResponse::MutableCorpusLoaded(result) => {
+            assert_eq!(result.corpus_id, corpus_id);
+            assert_eq!(result.summary.document_count, 2);
+            assert!(result.summary.has_dense_state);
+        }
+        other => panic!("unexpected storage response: {other:?}"),
+    }
+
+    let mut filtered = keyword_search_request(corpus_id, &["beta"]);
+    filtered.request.filter_condition = Some("topic = ?".into());
+    filtered.request.filter_parameters = Some(vec![serde_json::json!("metrics")]);
+    let filtered_response = runtime_result(&filtered);
+    assert_eq!(filtered_response.results[0].document_ids, vec![1]);
+
+    let semantic_after_reload = runtime_result(&worker_search_request(
+        corpus_id,
+        vec![vec![vec![1.0, 0.0], vec![0.7, 0.7]]],
+        None,
+    ));
+    assert_eq!(
+        semantic_after_reload.results,
+        semantic_before_reload.results
+    );
+
+    let hybrid_after_reload = runtime_result(&hybrid_search_request(corpus_id));
+    assert_eq!(hybrid_after_reload.results, hybrid_before_reload.results);
+
+    let health = runtime_health_response();
+    assert_eq!(health.loaded_indices, 1);
+    assert!(health.memory_usage_breakdown.index_bytes > 0);
+    assert!(health.memory_usage_breakdown.keyword_runtime_bytes > 0);
+}
+
+#[wasm_bindgen_test]
+async fn browser_storage_keyword_only_mutable_corpus_rejects_semantic_queries() {
+    reset_runtime_state();
+    let corpus_id = "mutable-demo-keyword-only";
+
+    let _ = storage_response(register_mutable_corpus_request(corpus_id, 2)).await;
+    let sync = storage_response(sync_mutable_corpus_request(
+        corpus_id,
+        mutable_snapshot_v1(),
+    ))
+    .await;
+    match sync {
+        StorageResponse::MutableCorpusSynced(result) => {
+            assert!(!result.summary.has_dense_state);
+        }
+        other => panic!("unexpected storage response: {other:?}"),
+    }
+
+    let semantic_error = runtime_error_response(RuntimeRequest::Search(worker_search_request(
+        corpus_id,
+        vec![vec![vec![1.0, 0.0], vec![0.7, 0.7]]],
+        None,
+    )));
+    assert_eq!(semantic_error.code, ErrorCode::InvalidRequest);
+    assert!(semantic_error
+        .message
+        .contains("semantic search requires semantic_embeddings"));
+}
+
+#[wasm_bindgen_test]
+async fn browser_storage_mutable_corpus_semantic_search_matches_direct_maxsim_path() {
+    reset_runtime_state();
+    let corpus_id = "mutable-demo-direct-semantic";
+    let snapshot = mutable_snapshot_v1_dense();
+
+    let _ = storage_response(register_mutable_corpus_request(corpus_id, 2)).await;
+    let _ = storage_response(sync_mutable_corpus_request(corpus_id, snapshot.clone())).await;
+
+    let request = worker_search_request(
+        corpus_id,
+        vec![vec![vec![1.0, 0.0], vec![0.7, 0.7]]],
+        Some(vec![1, 1, 0]),
+    );
+    let direct = direct_mutable_semantic_result(&snapshot, &request);
+    let runtime = runtime_result(&request);
+
+    assert_eq!(runtime.results, direct.results);
+    assert_eq!(runtime.num_queries, direct.num_queries);
+    assert_eq!(runtime.results[0].document_ids, vec![0, 1]);
+}
+
+#[wasm_bindgen_test]
+async fn browser_storage_rejects_invalid_mutable_dense_snapshots() {
+    reset_runtime_state();
+    let corpus_id = "mutable-demo-invalid-dense";
+
+    let _ = storage_response(register_mutable_corpus_request(corpus_id, 2)).await;
+
+    let partial = storage_error_response(sync_mutable_corpus_request(
+        corpus_id,
+        mutable_snapshot_partial_dense(),
+    ))
+    .await;
+    assert_eq!(partial.code, ErrorCode::InvalidRequest);
+    assert!(partial
+        .message
+        .contains("semantic_embeddings must be present for every document"));
+
+    let dim_mismatch = storage_error_response(sync_mutable_corpus_request(
+        corpus_id,
+        mutable_snapshot_dense_dim_mismatch(),
+    ))
+    .await;
+    assert_eq!(dim_mismatch.code, ErrorCode::InvalidRequest);
+    assert!(dim_mismatch
+        .message
+        .contains("semantic_embeddings.dim must match encoder.embedding_dim"));
+
+    let value_length_mismatch = storage_error_response(sync_mutable_corpus_request(
+        corpus_id,
+        mutable_snapshot_dense_value_length_mismatch(),
+    ))
+    .await;
+    assert_eq!(value_length_mismatch.code, ErrorCode::InvalidRequest);
+    assert!(value_length_mismatch
+        .message
+        .contains("semantic_embeddings.values length mismatch"));
+}
+
+#[wasm_bindgen_test]
+async fn browser_storage_mutable_corpus_tracks_embedding_updates_and_dense_noops() {
+    reset_runtime_state();
+    let corpus_id = "mutable-demo-dense-update-noop";
+
+    let _ = storage_response(register_mutable_corpus_request(corpus_id, 2)).await;
+    let _ = storage_response(sync_mutable_corpus_request(
+        corpus_id,
+        mutable_snapshot_v1_dense(),
+    ))
+    .await;
+
+    let updated = storage_response(sync_mutable_corpus_request(
+        corpus_id,
+        mutable_snapshot_v1_dense_embedding_update(),
+    ))
+    .await;
+    match updated {
+        StorageResponse::MutableCorpusSynced(result) => {
+            assert!(result.summary.has_dense_state);
+            assert!(result.sync.changed);
+            assert_eq!(result.sync.added, 0);
+            assert_eq!(result.sync.updated, 1);
+            assert_eq!(result.sync.deleted, 0);
+            assert_eq!(result.sync.unchanged, 1);
+        }
+        other => panic!("unexpected storage response: {other:?}"),
+    }
+
+    let noop = storage_response(sync_mutable_corpus_request(
+        corpus_id,
+        mutable_snapshot_v1_dense_embedding_update(),
+    ))
+    .await;
+    match noop {
+        StorageResponse::MutableCorpusSynced(result) => {
+            assert!(result.summary.has_dense_state);
+            assert!(!result.sync.changed);
+            assert_eq!(result.sync.added, 0);
+            assert_eq!(result.sync.updated, 0);
+            assert_eq!(result.sync.deleted, 0);
+            assert_eq!(result.sync.unchanged, 2);
+        }
+        other => panic!("unexpected storage response: {other:?}"),
+    }
+}
+
+#[wasm_bindgen_test]
+async fn browser_storage_mutable_corpus_rejects_query_dimension_mismatch() {
+    reset_runtime_state();
+    let corpus_id = "mutable-demo-query-dim-mismatch";
+
+    let _ = storage_response(register_mutable_corpus_request(corpus_id, 2)).await;
+    let _ = storage_response(sync_mutable_corpus_request(
+        corpus_id,
+        mutable_snapshot_v1_dense(),
+    ))
+    .await;
+
+    let mut request =
+        worker_search_request(corpus_id, vec![vec![vec![1.0, 0.0], vec![0.7, 0.7]]], None);
+    request.request.queries.as_mut().unwrap()[0].embeddings = Some(vec![vec![1.0, 0.0, 0.0, 0.0]]);
+
+    let error = runtime_error_response(RuntimeRequest::Search(request));
+    assert_eq!(error.code, ErrorCode::EmbeddingShapeMismatch);
+    assert!(error
+        .message
+        .contains("encoder.embedding_dim 2 does not match payload dimension 4"));
+}
+
+#[wasm_bindgen_test]
+async fn browser_storage_mutable_corpus_applies_delete_and_noop_sync_semantics() {
+    reset_runtime_state();
+    let corpus_id = "mutable-demo-delete-noop";
+    let next_snapshot = mutable_snapshot_v2();
+
+    let _ = storage_response(register_mutable_corpus_request(corpus_id, 2)).await;
+    let _ = storage_response(sync_mutable_corpus_request(
+        corpus_id,
+        mutable_snapshot_v1(),
+    ))
+    .await;
+
+    let replace = storage_response(sync_mutable_corpus_request(
+        corpus_id,
+        next_snapshot.clone(),
+    ))
+    .await;
+    match replace {
+        StorageResponse::MutableCorpusSynced(result) => {
+            assert_eq!(result.summary.document_count, 2);
+            assert!(result.sync.changed);
+            assert_eq!(result.sync.added, 1);
+            assert_eq!(result.sync.updated, 1);
+            assert_eq!(result.sync.deleted, 1);
+            assert_eq!(result.sync.unchanged, 0);
+        }
+        other => panic!("unexpected storage response: {other:?}"),
+    }
+
+    let deleted = runtime_result(&keyword_search_request(corpus_id, &["beta"]));
+    assert!(deleted.results[0].document_ids.is_empty());
+
+    let added = runtime_result(&keyword_search_request(corpus_id, &["gamma"]));
+    assert_eq!(added.results[0].document_ids, vec![1]);
+
+    let noop = storage_response(sync_mutable_corpus_request(corpus_id, next_snapshot)).await;
+    match noop {
+        StorageResponse::MutableCorpusSynced(result) => {
+            assert_eq!(result.summary.document_count, 2);
+            assert!(!result.sync.changed);
+            assert_eq!(result.sync.added, 0);
+            assert_eq!(result.sync.updated, 0);
+            assert_eq!(result.sync.deleted, 0);
+            assert_eq!(result.sync.unchanged, 2);
+        }
+        other => panic!("unexpected storage response: {other:?}"),
+    }
+}
+
+#[wasm_bindgen_test]
+async fn browser_storage_mutable_corpus_commits_empty_bootstrap_snapshot() {
+    reset_runtime_state();
+    let corpus_id = "mutable-demo-empty-bootstrap";
+
+    let _ = storage_response(register_mutable_corpus_request(corpus_id, 2)).await;
+
+    let sync = storage_response(sync_mutable_corpus_request(
+        corpus_id,
+        MutableCorpusSnapshot { documents: vec![] },
+    ))
+    .await;
+    match sync {
+        StorageResponse::MutableCorpusSynced(result) => {
+            assert_eq!(result.summary.document_count, 0);
+            assert!(!result.sync.changed);
+            assert_eq!(result.sync.added, 0);
+            assert_eq!(result.sync.updated, 0);
+            assert_eq!(result.sync.deleted, 0);
+            assert_eq!(result.sync.unchanged, 0);
+        }
+        other => panic!("unexpected storage response: {other:?}"),
+    }
+
+    reset_runtime_state();
+
+    let load = storage_response(load_mutable_corpus_request(corpus_id)).await;
+    match load {
+        StorageResponse::MutableCorpusLoaded(result) => {
+            assert_eq!(result.corpus_id, corpus_id);
+            assert_eq!(result.summary.document_count, 0);
+        }
+        other => panic!("unexpected storage response: {other:?}"),
+    }
+
+    let keyword = runtime_result(&keyword_search_request(corpus_id, &["alpha"]));
+    assert_eq!(keyword.num_queries, 1);
+    assert!(keyword.results[0].document_ids.is_empty());
+}
+
+#[wasm_bindgen_test]
+async fn browser_storage_mutable_corpus_persists_delete_by_omission_across_reload() {
+    reset_runtime_state();
+    let corpus_id = "mutable-demo-delete-reload";
+
+    let _ = storage_response(register_mutable_corpus_request(corpus_id, 2)).await;
+    let _ = storage_response(sync_mutable_corpus_request(
+        corpus_id,
+        mutable_snapshot_v1(),
+    ))
+    .await;
+    let _ = storage_response(sync_mutable_corpus_request(
+        corpus_id,
+        mutable_snapshot_v2(),
+    ))
+    .await;
+
+    reset_runtime_state();
+
+    let load = storage_response(load_mutable_corpus_request(corpus_id)).await;
+    match load {
+        StorageResponse::MutableCorpusLoaded(result) => {
+            assert_eq!(result.summary.document_count, 2);
+        }
+        other => panic!("unexpected storage response: {other:?}"),
+    }
+
+    let deleted = runtime_result(&keyword_search_request(corpus_id, &["beta"]));
+    assert!(deleted.results[0].document_ids.is_empty());
+
+    let retained = runtime_result(&keyword_search_request(corpus_id, &["alpha"]));
+    assert_eq!(retained.results[0].document_ids, vec![0]);
+    assert_eq!(
+        retained.results[0].metadata[0]
+            .as_ref()
+            .and_then(|value| value.get("title"))
+            .and_then(|value| value.as_str()),
+        Some("alpha launch memo v2")
+    );
+}
+
+#[wasm_bindgen_test]
+async fn browser_storage_mutable_corpus_requires_registration_and_locked_encoder() {
+    reset_runtime_state();
+    let corpus_id = "mutable-demo-registration-errors";
+
+    let missing_registration = storage_error_response(sync_mutable_corpus_request(
+        corpus_id,
+        mutable_snapshot_v1(),
+    ))
+    .await;
+    assert_eq!(missing_registration.code, ErrorCode::InvalidRequest);
+    assert!(missing_registration.message.contains("is not registered"));
+
+    let _ = storage_response(register_mutable_corpus_request(corpus_id, 2)).await;
+
+    reset_runtime_state();
+
+    let load = storage_response(load_mutable_corpus_request(corpus_id)).await;
+    match load {
+        StorageResponse::MutableCorpusLoaded(result) => {
+            assert_eq!(result.corpus_id, corpus_id);
+            assert_eq!(result.summary.document_count, 0);
+            assert!(result.summary.has_keyword_state);
+            assert!(!result.summary.has_dense_state);
+        }
+        other => panic!("expected mutable_corpus_loaded response, got {other:?}"),
+    }
+
+    let mismatch = storage_error_response(register_mutable_corpus_request(corpus_id, 4)).await;
+    assert_eq!(mismatch.code, ErrorCode::EncoderMismatch);
+
+    let tokenizer_mismatch = storage_error_response(
+        register_mutable_corpus_request_with_tokenizer(corpus_id, 2, FtsTokenizer::Trigram),
+    )
+    .await;
+    assert_eq!(tokenizer_mismatch.code, ErrorCode::InvalidRequest);
+    assert!(tokenizer_mismatch.message.contains("fts tokenizer"));
+}
+
+#[wasm_bindgen_test]
+async fn browser_storage_direct_same_corpus_sync_fails_fast() {
+    reset_runtime_state();
+    let corpus_id = "mutable-demo-direct-sync-in-progress";
+    let snapshot = mutable_snapshot_v1_dense();
+
+    let register = register_mutable_corpus(corpus_id, &encoder(2), FtsTokenizer::Unicode61).await;
+    assert!(register.is_ok());
+
+    let first_sync = future_to_promise({
+        let snapshot = snapshot.clone();
+        async move {
+            sync_mutable_corpus(corpus_id, &snapshot)
+                .await
+                .map(|_| JsValue::UNDEFINED)
+                .map_err(|error| JsValue::from_str(&error.to_string()))
+        }
+    });
+    next_microtask().await;
+
+    let second_sync = sync_mutable_corpus(corpus_id, &snapshot).await;
+    match second_sync {
+        Err(BrowserStorageError::MutableCorpusSyncInProgress(actual_corpus_id)) => {
+            assert_eq!(actual_corpus_id, corpus_id);
+        }
+        other => panic!("expected direct sync_in_progress error, got {other:?}"),
+    }
+
+    JsFuture::from(first_sync)
+        .await
+        .expect("first direct sync should complete successfully");
+
+    let stored = load_mutable_corpus(corpus_id)
+        .await
+        .expect("stored mutable corpus should reload after direct sync");
+    assert_eq!(stored.summary.document_count, 2);
+    assert!(stored.summary.has_dense_state);
 }
 
 #[wasm_bindgen_test]

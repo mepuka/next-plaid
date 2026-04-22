@@ -4,29 +4,14 @@ import type {
   BundleInstalledResponseEnvelope,
   BundleManifest,
   EncoderIdentity,
-  HealthRequestEnvelope,
-  HealthResponseEnvelope,
-  IndexLoadedResponseEnvelope,
   InstallBundleRequestEnvelope,
   LoadIndexRequestEnvelope,
   LoadStoredBundleRequestEnvelope,
   QueryEmbeddingsPayload,
-  SearchResultsResponseEnvelope,
-  SearchWorkerRequest,
-  SearchWorkerResponse,
-  StoredBundleLoadedResponseEnvelope,
   SearchRequestEnvelope,
+  SearchResultsResponseEnvelope,
 } from "../shared/search-contract.js";
-import type {
-  EncodeResponse,
-  EncoderDisposeResponse,
-  EncoderHealthResponse,
-  EncoderInitEvent,
-  EncoderInitRequest,
-  EncoderInitResponse,
-  EncoderWorkerRequest,
-} from "../model-worker/types.js";
-import type { WorkerResponseEnvelope } from "../shared/worker-envelope.js";
+import type { EncoderInitEvent, EncoderInitRequest } from "../model-worker/types.js";
 import {
   makeBrowserSearchRuntimeManagedRuntimeFromFactories,
 } from "../effect/browser-runtime-app.js";
@@ -56,8 +41,6 @@ const statusNode = (() => {
   }
   return node;
 })();
-const WORKER_REQUEST_TIMEOUT_MS = 15_000;
-
 const DENSE_ENCODER: EncoderIdentity = {
   encoder_id: "demo-smoke-dense",
   encoder_build: "demo-smoke-dense-build-1",
@@ -74,14 +57,192 @@ const STORED_ENCODER: EncoderIdentity = {
 
 const PROOF_ENCODER: EncoderIdentity = {
   encoder_id: "tiny-encoder-proof",
-  encoder_build: "tiny-encoder-proof-v1",
+  encoder_build: "tiny-encoder-proof-v2",
   embedding_dim: 4,
   normalized: true,
 };
+const MUTABLE_CORPUS_ID = "mutable-smoke";
+
+interface RealModelPreset {
+  readonly id: string;
+  readonly modelId: string;
+  readonly modelFile: string;
+  readonly embeddingDim: number;
+  readonly normalized: boolean;
+}
+
+interface RealCorpusDocumentFixture {
+  readonly document_id: string;
+  readonly semantic_text: string;
+  readonly metadata: {
+    readonly slug: string;
+    readonly title: string;
+    readonly source: string;
+  };
+}
+
+interface RealCorpusQueryFixture {
+  readonly id: string;
+  readonly text: string;
+  readonly expectedSlug: string;
+}
+
+interface RealCorpusFixture {
+  readonly id: string;
+  readonly documents: readonly RealCorpusDocumentFixture[];
+  readonly queries: readonly RealCorpusQueryFixture[];
+}
+
+const REAL_MODEL_PRESETS: readonly RealModelPreset[] = [
+  {
+    id: "mxbai-edge-colbert-v0-32m-onnx",
+    modelId: "lightonai/mxbai-edge-colbert-v0-32m-onnx",
+    modelFile: "model_int8.onnx",
+    embeddingDim: 64,
+    normalized: true,
+  },
+  {
+    id: "answerai-colbert-small-v1-onnx",
+    modelId: "lightonai/answerai-colbert-small-v1-onnx",
+    modelFile: "model_int8.onnx",
+    embeddingDim: 96,
+    normalized: true,
+  },
+  {
+    id: "GTE-ModernColBERT-v1",
+    modelId: "lightonai/GTE-ModernColBERT-v1",
+    modelFile: "model_int8.onnx",
+    embeddingDim: 128,
+    normalized: true,
+  },
+] as const;
+
+const REAL_CORPUS_NEXT_PLAID_DOCS: RealCorpusFixture = {
+  id: "next-plaid-docs-v1",
+  documents: [
+    {
+      document_id: "why-multi-vector",
+      semantic_text:
+        "Standard vector search collapses an entire document into one embedding, which is a lossy summary. Multi-vector retrieval keeps many embeddings per document instead of one. At query time, each query token finds its best match across document tokens with MaxSim. That keeps more detail from names, parameters, docstrings, and control flow than a single vector summary.",
+      metadata: {
+        slug: "why_multi_vector",
+        title: "Why Multi-Vector Retrieval Matters",
+        source: "README.md",
+      },
+    },
+    {
+      document_id: "api-cpu-quickstart",
+      semantic_text:
+        "Run NextPlaid API with Docker on CPU using a built-in model. The quick start runs the container, mounts a local data directory, exposes port 8080, and passes the model flag lightonai slash answerai-colbert-small-v1-onnx together with int8 quantization.",
+      metadata: {
+        slug: "api_cpu_quickstart",
+        title: "API CPU Quick Start",
+        source: "next-plaid-api/README.md",
+      },
+    },
+    {
+      document_id: "api-two-modes",
+      semantic_text:
+        "The API has two modes depending on whether you pass a model. With a model, callers send text and the server encodes it through ONNX Runtime. Without a model, callers must provide embeddings directly and text encoding endpoints are unavailable. The no-model mode is for custom models and external encoding pipelines.",
+      metadata: {
+        slug: "api_two_modes",
+        title: "API With Model Versus Without Model",
+        source: "next-plaid-api/README.md",
+      },
+    },
+    {
+      document_id: "ready-to-use-models",
+      semantic_text:
+        "Ready-to-use models include lightonai slash mxbai-edge-colbert-v0-32m-onnx and lightonai slash answerai-colbert-small-v1-onnx for lightweight text retrieval, and lightonai slash GTE-ModernColBERT-v1 for more accurate text retrieval. LateOn-Code-edge is lightweight for code search, while LateOn-Code is the more accurate code-search model.",
+      metadata: {
+        slug: "ready_to_use_models",
+        title: "Ready To Use Model Guide",
+        source: "README.md",
+      },
+    },
+    {
+      document_id: "colgrep-overview",
+      semantic_text:
+        "ColGREP is semantic code search for the terminal and coding agents. Searches combine regex filtering with semantic ranking, stay fully local, and use Tree-sitter structure plus a multi-vector model before ranking with NextPlaid.",
+      metadata: {
+        slug: "colgrep_overview",
+        title: "ColGREP Overview",
+        source: "README.md",
+      },
+    },
+  ],
+  queries: [
+    {
+      id: "lightweight-text-model",
+      text: "Which model is lightweight for text retrieval?",
+      expectedSlug: "ready_to_use_models",
+    },
+    {
+      id: "cpu-docker-model",
+      text: "How do I run the API on CPU with a built in model?",
+      expectedSlug: "api_cpu_quickstart",
+    },
+    {
+      id: "single-vector-loss",
+      text: "Why is multi vector retrieval better than one embedding per document?",
+      expectedSlug: "why_multi_vector",
+    },
+    {
+      id: "api-no-model",
+      text: "What happens when the API runs without a model?",
+      expectedSlug: "api_two_modes",
+    },
+    {
+      id: "what-is-colgrep",
+      text: "What is ColGREP used for?",
+      expectedSlug: "colgrep_overview",
+    },
+  ],
+} as const;
 
 function setStatus(state: string, value: unknown): void {
   statusNode.dataset.state = state;
   statusNode.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+}
+
+function currentScenario(): string {
+  return new URLSearchParams(window.location.search).get("scenario") ?? "wrapper-smoke";
+}
+
+function currentRealModelPreset(): RealModelPreset {
+  const requested = new URLSearchParams(window.location.search).get("modelPreset") ??
+    REAL_MODEL_PRESETS[0].id;
+  const preset = REAL_MODEL_PRESETS.find((candidate) => candidate.id === requested);
+  if (preset === undefined) {
+    throw new Error(`unknown real model preset: ${requested}`);
+  }
+  return preset;
+}
+
+function currentRealCorpusFixture(): RealCorpusFixture {
+  const requested = new URLSearchParams(window.location.search).get("corpusPreset") ??
+    REAL_CORPUS_NEXT_PLAID_DOCS.id;
+  if (requested !== REAL_CORPUS_NEXT_PLAID_DOCS.id) {
+    throw new Error(`unknown real corpus preset: ${requested}`);
+  }
+  return REAL_CORPUS_NEXT_PLAID_DOCS;
+}
+
+function huggingFaceResolveUrl(modelId: string, fileName: string): string {
+  return `https://huggingface.co/${modelId}/resolve/main/${fileName}`;
+}
+
+function realModelEncoderIdentity(preset: RealModelPreset): EncoderIdentity {
+  return {
+    encoder_id: preset.modelId,
+    encoder_build: `${preset.modelFile}@main`,
+    embedding_dim: preset.embeddingDim,
+    normalized: preset.normalized,
+  };
+}
+
+function realModelCorpusId(preset: RealModelPreset, corpus: RealCorpusFixture): string {
+  return `real-model-${preset.id}-${corpus.id}`;
 }
 
 function embeddingPayload(
@@ -162,6 +323,61 @@ function loadEncodedIndexRequest(): LoadIndexRequestEnvelope {
     nbits: 2,
     fts_tokenizer: "unicode61",
     max_documents: null,
+  };
+}
+
+function mutableCorpusRegisterArgs() {
+  return {
+    corpusId: MUTABLE_CORPUS_ID,
+    encoder: PROOF_ENCODER,
+    ftsTokenizer: "unicode61" as const,
+  };
+}
+
+function mutableCorpusSyncArgs() {
+  return {
+    corpusId: MUTABLE_CORPUS_ID,
+    snapshot: {
+      documents: [
+        {
+          document_id: "doc-alpha",
+          semantic_text: "alpha launch semantic body",
+          metadata: {
+            title: "alpha launch memo",
+            topic: "edge",
+          },
+        },
+        {
+          document_id: "doc-beta",
+          semantic_text: "beta report semantic body",
+          metadata: {
+            title: "beta report summary",
+            topic: "metrics",
+          },
+        },
+      ],
+    },
+  };
+}
+
+function mutableCorpusSearchArgs() {
+  return {
+    corpusId: MUTABLE_CORPUS_ID,
+    queryText: "alpha",
+    request: {
+      params: {
+        top_k: 2,
+        n_ivf_probe: 2,
+        n_full_scores: 2,
+        centroid_score_threshold: null,
+      },
+      subset: null,
+      text_query: null,
+      alpha: null,
+      fusion: null,
+      filter_condition: null,
+      filter_parameters: null,
+    },
   };
 }
 
@@ -367,7 +583,20 @@ function encoderInitRequest(): EncoderInitRequest {
       encoder: PROOF_ENCODER,
       modelUrl: "../fixtures/encoder-proof/tiny-encoder.onnx",
       onnxConfigUrl: "../fixtures/encoder-proof/onnx_config.json",
-      tokenizerUrl: "../fixtures/encoder-proof/tokenizer-fixture.json",
+      tokenizerUrl: "../fixtures/encoder-proof/tokenizer.json",
+      prefer: "wasm",
+    },
+  };
+}
+
+function realModelEncoderInitRequest(preset: RealModelPreset): EncoderInitRequest {
+  return {
+    type: "init",
+    payload: {
+      encoder: realModelEncoderIdentity(preset),
+      modelUrl: huggingFaceResolveUrl(preset.modelId, preset.modelFile),
+      onnxConfigUrl: huggingFaceResolveUrl(preset.modelId, "onnx_config.json"),
+      tokenizerUrl: huggingFaceResolveUrl(preset.modelId, "tokenizer.json"),
       prefer: "wasm",
     },
   };
@@ -390,97 +619,79 @@ function encodedSearchRequest(payload: QueryEmbeddingsPayload): SearchRequestEnv
   };
 }
 
-function unwrapSearchResponse<T extends SearchWorkerResponse>(
-  response: T,
-): Exclude<T, Extract<SearchWorkerResponse, { type: "error" }>> {
-  if (response.type === "error") {
-    throw new Error(`search worker returned ${response.code}: ${response.message}`);
-  }
-  return response as Exclude<T, Extract<SearchWorkerResponse, { type: "error" }>>;
+function realCorpusSearchArgs(corpusId: string, queryText: string) {
+  return {
+    corpusId,
+    queryText,
+    request: {
+      params: {
+        top_k: 3,
+        n_ivf_probe: 8,
+        n_full_scores: 16,
+        centroid_score_threshold: null,
+      },
+      subset: null,
+      text_query: null,
+      alpha: null,
+      fusion: null,
+      filter_condition: null,
+      filter_parameters: null,
+    },
+  };
 }
 
-async function callWorker<TRequest, TResponse, TEvent = never>(
-  worker: Worker,
-  request: TRequest,
-  options?: { onEvent?: (event: TEvent) => void },
-): Promise<TResponse> {
-  const requestId = crypto.randomUUID();
+function summarizeRealCorpusSearch(
+  query: RealCorpusQueryFixture,
+  response: SearchResultsResponseEnvelope,
+) {
+  const firstResult = response.results[0];
+  const returnedMetadata = Array.isArray(firstResult?.metadata) ? firstResult.metadata : [];
+  const returnedSlugs = returnedMetadata.map((entry) =>
+    entry &&
+      typeof entry === "object" &&
+      "slug" in entry &&
+      typeof entry.slug === "string"
+      ? entry.slug
+      : null
+  );
+  const returnedTitles = returnedMetadata.map((entry) =>
+    entry &&
+      typeof entry === "object" &&
+      "title" in entry &&
+      typeof entry.title === "string"
+      ? entry.title
+      : null
+  );
 
-  return new Promise<TResponse>((resolve, reject) => {
-    const timeoutId = setTimeout(() => {
-      cleanup();
-      reject(
-        new Error(
-          `Worker request timed out after ${WORKER_REQUEST_TIMEOUT_MS}ms: ${
-            (request as { type?: string })?.type ?? "unknown"
-          }`,
-        ),
-      );
-    }, WORKER_REQUEST_TIMEOUT_MS);
-
-    const cleanup = (): void => {
-      clearTimeout(timeoutId);
-      worker.removeEventListener("message", handleMessage);
-      worker.removeEventListener("error", handleError);
-      worker.removeEventListener("messageerror", handleMessageError);
-    };
-
-    const handleMessage = (event: MessageEvent<unknown>): void => {
-      const frame = event.data;
-      if (!Array.isArray(frame) || frame.length < 2 || frame[0] !== 1) {
-        return;
-      }
-      const envelope = frame[1] as WorkerResponseEnvelope<TResponse, TEvent>;
-      if (envelope?.requestId !== requestId) {
-        return;
-      }
-
-      if (envelope.ok && "event" in envelope) {
-        options?.onEvent?.(envelope.event);
-        return;
-      }
-
-      cleanup();
-      if (envelope.ok) {
-        resolve(envelope.response);
-      } else {
-        reject(new Error(envelope.error));
-      }
-    };
-
-    const handleError = (event: ErrorEvent): void => {
-      cleanup();
-      reject(new Error(`Worker error while handling ${(request as { type?: string })?.type ?? "unknown"}: ${event.message}`));
-    };
-
-    const handleMessageError = (): void => {
-      cleanup();
-      reject(new Error(`Worker messageerror while handling ${(request as { type?: string })?.type ?? "unknown"}`));
-    };
-
-    worker.addEventListener("message", handleMessage);
-    worker.addEventListener("error", handleError);
-    worker.addEventListener("messageerror", handleMessageError);
-    worker.postMessage([0, { requestId, request }]);
-  });
-}
-
-async function callSearchWorker<TResponse extends SearchWorkerResponse>(
-  worker: Worker,
-  request: SearchWorkerRequest,
-): Promise<Exclude<TResponse, Extract<SearchWorkerResponse, { type: "error" }>>> {
-  const response = await callWorker<SearchWorkerRequest, TResponse>(worker, request);
-  return unwrapSearchResponse(response);
+  return {
+    queryId: query.id,
+    queryText: query.text,
+    expectedSlug: query.expectedSlug,
+    returnedSlugs,
+    returnedTitles,
+    scores: firstResult?.scores ?? [],
+  };
 }
 
 async function runWrapperSmoke(): Promise<unknown> {
   const initialRuntime = makeHarnessRuntime();
-  let initialPhase: unknown;
+  let initialPhase: {
+    readonly initialState: unknown;
+    readonly initialLoadedIndexCount: number;
+    readonly installBundle: BundleInstalledResponseEnvelope;
+    readonly registerCorpus: unknown;
+    readonly encoderCapabilities: unknown;
+    readonly syncCorpus: unknown;
+    readonly mutableSearch: unknown;
+  };
   try {
     initialPhase = await initialRuntime.runPromise(
       Effect.gen(function*() {
         const searchClient = yield* SearchWorkerClient;
+        const encoderClient = yield* EncoderWorkerClient;
+        const runtimeService = yield* BrowserSearchRuntime;
         const initialState = yield* SubscriptionRef.get(searchClient.state);
+        const initialLoadedIndices = yield* SubscriptionRef.get(runtimeService.loadedIndices);
         const installBundle = yield* searchClient.installBundle(
           yield* Effect.tryPromise({
             try: () => installStoredBundleRequest(),
@@ -493,9 +704,22 @@ async function runWrapperSmoke(): Promise<unknown> {
               }),
           }),
         );
+        const registerCorpus = yield* runtimeService.registerCorpus(
+          mutableCorpusRegisterArgs(),
+        );
+        const encoderCapabilities = yield* encoderClient.init(encoderInitRequest().payload);
+        const syncCorpus = yield* runtimeService.syncCorpus(mutableCorpusSyncArgs());
+        const mutableSearch = yield* runtimeService.searchCorpus(
+          mutableCorpusSearchArgs(),
+        );
         return {
           initialState,
+          initialLoadedIndexCount: initialLoadedIndices.size,
           installBundle,
+          registerCorpus,
+          encoderCapabilities,
+          syncCorpus,
+          mutableSearch,
         };
       }),
     );
@@ -511,13 +735,32 @@ async function runWrapperSmoke(): Promise<unknown> {
           const searchClient = yield* SearchWorkerClient;
           const encoderClient = yield* EncoderWorkerClient;
           const runtimeService = yield* BrowserSearchRuntime;
+          const reloadedInitialHealth = {
+            loaded_indices: (yield* SubscriptionRef.get(runtimeService.loadedIndices)).size,
+          };
           const searchState = yield* SubscriptionRef.get(runtimeService.searchState);
 
           const loadStoredBundle = yield* searchClient.loadStoredBundle(loadStoredBundleRequest());
+          const storedSemanticSearch = yield* searchClient.search(storedSemanticSearchRequest());
+          const storedKeywordSearch = yield* searchClient.search(storedKeywordSearchRequest());
+          const storedHybridSearch = yield* searchClient.search(storedHybridSearchRequest());
+          const storedFilteredKeywordSearch = yield* searchClient.search(
+            storedFilteredKeywordSearchRequest(),
+          );
           const load = yield* searchClient.loadIndex(loadIndexRequest());
           const loadEncodedIndex = yield* searchClient.loadIndex(loadEncodedIndexRequest());
           const semanticSearch = yield* searchClient.search(semanticSearchRequest());
+          const keywordSearch = yield* searchClient.search(keywordSearchRequest());
           const hybridSearch = yield* searchClient.search(hybridSearchRequest());
+          const filteredSemanticSearch = yield* searchClient.search(
+            filteredSemanticSearchRequest(),
+          );
+          const filteredKeywordSearch = yield* searchClient.search(
+            filteredKeywordSearchRequest(),
+          );
+          const health = {
+            loaded_indices: (yield* SubscriptionRef.get(runtimeService.loadedIndices)).size,
+          };
 
           const encoderEvents: EncoderInitEvent[] = [];
           yield* Stream.runForEach(encoderClient.events, (event) =>
@@ -530,9 +773,9 @@ async function runWrapperSmoke(): Promise<unknown> {
 
           const encoderCapabilities = yield* encoderClient.init(encoderInitRequest().payload);
           const encoderState = yield* SubscriptionRef.get(runtimeService.encoderState);
-          const encodedQuery = yield* encoderClient.encode({ text: "alpha" });
+          const encodedQueryValue = yield* encoderClient.encodeQuery({ text: "alpha" });
           const encodedSearch = yield* runtimeService.searchWithEmbeddings(
-            encodedSearchRequest(encodedQuery.payload),
+            encodedSearchRequest(encodedQueryValue.payload),
           );
           const runtimeEncodedSearch = yield* runtimeService.encodeAndSearch({
             text: "alpha",
@@ -555,28 +798,210 @@ async function runWrapperSmoke(): Promise<unknown> {
               },
             },
           });
+          const mutableReloadedSync = yield* runtimeService.syncCorpus(
+            mutableCorpusSyncArgs(),
+          );
+          const mutableReloadedSearch = yield* runtimeService.searchCorpus(
+            mutableCorpusSearchArgs(),
+          );
+          const mutableCorpusState = (yield* SubscriptionRef.get(
+            runtimeService.mutableCorpora,
+          )).get(MUTABLE_CORPUS_ID) ?? null;
 
           return {
+            initialHealth: {
+              loaded_indices: initialPhase.initialLoadedIndexCount,
+            },
+            initialState: initialPhase.initialState,
+            installBundle: initialPhase.installBundle,
+            registerCorpus: initialPhase.registerCorpus,
+            initialEncoderCapabilities: initialPhase.encoderCapabilities,
+            syncCorpus: initialPhase.syncCorpus,
+            mutableSearch: initialPhase.mutableSearch,
+            reloadedInitialHealth,
             searchState,
             loadStoredBundle,
+            storedSemanticSearch,
+            storedKeywordSearch,
+            storedHybridSearch,
+            storedFilteredKeywordSearch,
             load,
             loadEncodedIndex,
+            health,
             semanticSearch,
+            keywordSearch,
             hybridSearch,
-            encoderEvents,
+            filteredSemanticSearch,
+            filteredKeywordSearch,
+            encoderInitEvents: encoderEvents,
             encoderCapabilities,
+            encoderInit: {
+              type: "encoder_ready" as const,
+              state: "ready" as const,
+              capabilities: encoderCapabilities,
+            },
+            encoderHealth: {
+              state: encoderState.status,
+              capabilities: encoderState.status === "ready"
+                ? encoderState.capabilities
+                : encoderState.capabilities,
+            },
             encoderState,
-            encodedQuery,
+            encodedQuery: {
+              type: "encoded_query" as const,
+              encoded: encodedQueryValue,
+            },
             encodedSearch,
             runtimeEncodedSearch,
+            mutableReloadedSync,
+            mutableReloadedSearch,
+            mutableCorpusState,
+          };
+        }),
+      ),
+    );
+    return runtimePhase;
+  } finally {
+    await runtime.dispose();
+  }
+}
+
+async function runRealModelProbe(): Promise<unknown> {
+  const modelPreset = currentRealModelPreset();
+  const corpus = currentRealCorpusFixture();
+  const corpusId = realModelCorpusId(modelPreset, corpus);
+  const initRequest = realModelEncoderInitRequest(modelPreset);
+
+  const initialRuntime = makeHarnessRuntime();
+  let initialPhase: {
+    readonly encoderInitEvents: readonly EncoderInitEvent[];
+    readonly encoderCapabilities: unknown;
+    readonly registerCorpus: unknown;
+    readonly syncCorpus: unknown;
+    readonly searches: readonly unknown[];
+    readonly mutableCorpusState: unknown;
+  };
+  try {
+    initialPhase = await initialRuntime.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const encoderClient = yield* EncoderWorkerClient;
+          const runtimeService = yield* BrowserSearchRuntime;
+          const encoderEvents: EncoderInitEvent[] = [];
+
+          yield* Stream.runForEach(encoderClient.events, (event) =>
+            Effect.sync(() => {
+              if (event.stage !== "failed" && event.stage !== "disposed") {
+                encoderEvents.push(event);
+              }
+            }),
+          ).pipe(Effect.forkScoped);
+
+          const encoderCapabilities = yield* encoderClient.init(initRequest.payload);
+          const registerCorpus = yield* runtimeService.registerCorpus({
+            corpusId,
+            encoder: {
+              encoder_id: encoderCapabilities.encoderId,
+              encoder_build: encoderCapabilities.encoderBuild,
+              embedding_dim: encoderCapabilities.embeddingDim,
+              normalized: encoderCapabilities.normalized,
+            },
+            ftsTokenizer: "unicode61",
+          });
+          const syncCorpus = yield* runtimeService.syncCorpus({
+            corpusId,
+            snapshot: {
+              documents: [...corpus.documents],
+            },
+          });
+          const searches = yield* Effect.forEach(
+            corpus.queries,
+            (query) =>
+              runtimeService.searchCorpus(realCorpusSearchArgs(corpusId, query.text)).pipe(
+                Effect.map((response) => summarizeRealCorpusSearch(query, response)),
+              ),
+            { concurrency: 1 },
+          );
+          const mutableCorpusState = (yield* SubscriptionRef.get(
+            runtimeService.mutableCorpora,
+          )).get(corpusId) ?? null;
+
+          return {
+            encoderInitEvents: [...encoderEvents],
+            encoderCapabilities,
+            registerCorpus,
+            syncCorpus,
+            searches,
+            mutableCorpusState,
+          };
+        }),
+      ),
+    );
+  } finally {
+    await initialRuntime.dispose();
+  }
+
+  const runtime = makeHarnessRuntime();
+  try {
+    const reloadedPhase = await runtime.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const encoderClient = yield* EncoderWorkerClient;
+          const runtimeService = yield* BrowserSearchRuntime;
+          const encoderEvents: EncoderInitEvent[] = [];
+
+          yield* Stream.runForEach(encoderClient.events, (event) =>
+            Effect.sync(() => {
+              if (event.stage !== "failed" && event.stage !== "disposed") {
+                encoderEvents.push(event);
+              }
+            }),
+          ).pipe(Effect.forkScoped);
+
+          const encoderCapabilities = yield* encoderClient.init(initRequest.payload);
+          const searches = yield* Effect.forEach(
+            corpus.queries,
+            (query) =>
+              runtimeService.searchCorpus(realCorpusSearchArgs(corpusId, query.text)).pipe(
+                Effect.map((response) => summarizeRealCorpusSearch(query, response)),
+              ),
+            { concurrency: 1 },
+          );
+          const syncCorpus = yield* runtimeService.syncCorpus({
+            corpusId,
+            snapshot: {
+              documents: [...corpus.documents],
+            },
+          });
+          const mutableCorpusState = (yield* SubscriptionRef.get(
+            runtimeService.mutableCorpora,
+          )).get(corpusId) ?? null;
+
+          return {
+            encoderInitEvents: [...encoderEvents],
+            encoderCapabilities,
+            searches,
+            syncCorpus,
+            mutableCorpusState,
           };
         }),
       ),
     );
 
     return {
+      scenario: "real-model-probe",
+      modelPreset: {
+        id: modelPreset.id,
+        modelId: modelPreset.modelId,
+        modelFile: modelPreset.modelFile,
+      },
+      corpus: {
+        id: corpus.id,
+        documentCount: corpus.documents.length,
+        queryCount: corpus.queries.length,
+      },
       initialPhase,
-      runtimePhase,
+      reloadedPhase,
     };
   } finally {
     await runtime.dispose();
@@ -584,139 +1009,16 @@ async function runWrapperSmoke(): Promise<unknown> {
 }
 
 async function main(): Promise<void> {
-  const worker = new Worker("./search-worker.js", { type: "module" });
-  const encoderWorker = new Worker("./encoder-worker.js", { type: "module" });
-  let reloadWorker: Worker | null = null;
-
   try {
-    const initialHealth = await callSearchWorker<HealthResponseEnvelope>(
-      worker,
-      { type: "health" } satisfies HealthRequestEnvelope,
-    );
-    const installBundle = await callSearchWorker<BundleInstalledResponseEnvelope>(
-      worker,
-      await installStoredBundleRequest(),
-    );
-    worker.terminate();
-
-    reloadWorker = new Worker("./search-worker.js", { type: "module" });
-    const reloadedInitialHealth = await callSearchWorker<HealthResponseEnvelope>(
-      reloadWorker,
-      { type: "health" } satisfies HealthRequestEnvelope,
-    );
-    const loadStoredBundle = await callSearchWorker<StoredBundleLoadedResponseEnvelope>(
-      reloadWorker,
-      loadStoredBundleRequest(),
-    );
-    const storedSemanticSearch = await callSearchWorker<SearchResultsResponseEnvelope>(
-      reloadWorker,
-      storedSemanticSearchRequest(),
-    );
-    const storedKeywordSearch = await callSearchWorker<SearchResultsResponseEnvelope>(
-      reloadWorker,
-      storedKeywordSearchRequest(),
-    );
-    const storedHybridSearch = await callSearchWorker<SearchResultsResponseEnvelope>(
-      reloadWorker,
-      storedHybridSearchRequest(),
-    );
-    const storedFilteredKeywordSearch = await callSearchWorker<SearchResultsResponseEnvelope>(
-      reloadWorker,
-      storedFilteredKeywordSearchRequest(),
-    );
-    const load = await callSearchWorker<IndexLoadedResponseEnvelope>(reloadWorker, loadIndexRequest());
-    const loadEncodedIndex = await callSearchWorker<IndexLoadedResponseEnvelope>(
-      reloadWorker,
-      loadEncodedIndexRequest(),
-    );
-    const health = await callSearchWorker<HealthResponseEnvelope>(
-      reloadWorker,
-      { type: "health" } satisfies HealthRequestEnvelope,
-    );
-    const semanticSearch = await callSearchWorker<SearchResultsResponseEnvelope>(
-      reloadWorker,
-      semanticSearchRequest(),
-    );
-    const keywordSearch = await callSearchWorker<SearchResultsResponseEnvelope>(
-      reloadWorker,
-      keywordSearchRequest(),
-    );
-    const hybridSearch = await callSearchWorker<SearchResultsResponseEnvelope>(
-      reloadWorker,
-      hybridSearchRequest(),
-    );
-    const filteredSemanticSearch = await callSearchWorker<SearchResultsResponseEnvelope>(
-      reloadWorker,
-      filteredSemanticSearchRequest(),
-    );
-    const filteredKeywordSearch = await callSearchWorker<SearchResultsResponseEnvelope>(
-      reloadWorker,
-      filteredKeywordSearchRequest(),
-    );
-
-    const encoderInitEvents: EncoderInitEvent[] = [];
-    const encoderInit = await callWorker<EncoderWorkerRequest, EncoderInitResponse, EncoderInitEvent>(
-      encoderWorker,
-      encoderInitRequest(),
-      {
-        onEvent: (event) => {
-          encoderInitEvents.push(event);
-        },
-      },
-    );
-    const encoderHealth = await callWorker<EncoderWorkerRequest, EncoderHealthResponse>(
-      encoderWorker,
-      { type: "health" },
-    );
-    const encodedQuery = await callWorker<EncoderWorkerRequest, EncodeResponse>(encoderWorker, {
-      type: "encode",
-      payload: { text: "alpha" },
-    });
-    const encodedSearch = await callSearchWorker<SearchResultsResponseEnvelope>(
-      reloadWorker,
-      encodedSearchRequest(encodedQuery.encoded.payload),
-    );
-    const disposeEncoder = await callWorker<EncoderWorkerRequest, EncoderDisposeResponse>(
-      encoderWorker,
-      { type: "dispose" },
-    );
-    const wrapperSmoke = await runWrapperSmoke();
-
-    const result = {
-      initialHealth,
-      installBundle,
-      reloadedInitialHealth,
-      loadStoredBundle,
-      storedSemanticSearch,
-      storedKeywordSearch,
-      storedHybridSearch,
-      storedFilteredKeywordSearch,
-      load,
-      loadEncodedIndex,
-      health,
-      semanticSearch,
-      keywordSearch,
-      hybridSearch,
-      filteredSemanticSearch,
-      filteredKeywordSearch,
-      encoderInitEvents,
-      encoderInit,
-      encoderHealth,
-      encodedQuery,
-      encodedSearch,
-      disposeEncoder,
-      wrapperSmoke,
-    };
+    const result = currentScenario() === "real-model-probe"
+      ? await runRealModelProbe()
+      : await runWrapperSmoke();
     window.__NEXT_PLAID_SMOKE_RESULT__ = result;
     setStatus("ok", result);
   } catch (error) {
     const message = error instanceof Error ? error.stack ?? error.message : String(error);
     window.__NEXT_PLAID_SMOKE_ERROR__ = message;
     setStatus("error", message);
-  } finally {
-    worker.terminate();
-    reloadWorker?.terminate();
-    encoderWorker.terminate();
   }
 }
 

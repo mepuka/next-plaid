@@ -1,4 +1,3 @@
-import * as BrowserWorker from "@effect/platform-browser/BrowserWorker";
 import { expect, it, layer } from "@effect/vitest";
 import {
   Context,
@@ -11,11 +10,15 @@ import {
 import * as Exit from "effect/Exit";
 
 import type {
+  LoadMutableCorpusRequestEnvelope,
   LoadIndexRequestEnvelope,
+  RegisterMutableCorpusRequestEnvelope,
   RuntimeErrorResponseEnvelope,
   SearchRequestEnvelope,
+  SyncMutableCorpusRequestEnvelope,
 } from "../shared/search-contract.js";
 import type { SearchClientError } from "./client-errors.js";
+import { SearchMetadataCatalog } from "./search-metadata-catalog.js";
 import {
   SearchWorkerClient,
   type SearchWorkerState,
@@ -24,6 +27,7 @@ import {
   type FakeSpawner,
   makeFakeSpawner,
 } from "./__tests__/fake-spawner.js";
+import * as BrowserWorker from "./browser-worker.js";
 
 interface SearchHarnessApi {
   readonly fake: FakeSpawner;
@@ -36,19 +40,22 @@ class SearchHarness
 {}
 
 function makeSearchHarnessLayer(): Layer.Layer<
-  SearchHarness | SearchWorkerClient,
+  SearchHarness | SearchWorkerClient | SearchMetadataCatalog,
   SearchClientError
 > {
   const fake = makeFakeSpawner();
   const workerLayer = BrowserWorker.layer((id) => fake.spawn(id));
-  const clientLayer = SearchWorkerClient.layer().pipe(Layer.provide(workerLayer));
+  const catalogLayer = SearchMetadataCatalog.layer;
+  const clientLayer = SearchWorkerClient.layer().pipe(
+    Layer.provide(Layer.mergeAll(workerLayer, catalogLayer)),
+  );
   const harnessLayer = Layer.succeed(SearchHarness)(
     SearchHarness.of({
       fake,
     }),
   );
 
-  return Layer.mergeAll(clientLayer, harnessLayer);
+  return Layer.mergeAll(clientLayer, catalogLayer, harnessLayer);
 }
 
 function searchRequest(): SearchRequestEnvelope {
@@ -112,6 +119,51 @@ function indexLoadedResponse() {
   } as const;
 }
 
+function mutableCorpusSummary(documentCount: number) {
+  return {
+    corpus_id: "proof-corpus",
+    document_count: documentCount,
+    has_keyword_state: true,
+    has_dense_state: false,
+    encoder: proofEncoder(),
+  } as const;
+}
+
+function registerMutableCorpusRequest(): RegisterMutableCorpusRequestEnvelope {
+  return {
+    type: "register_mutable_corpus",
+    corpus_id: "proof-corpus",
+    encoder: proofEncoder(),
+    fts_tokenizer: "unicode61",
+  } as unknown as RegisterMutableCorpusRequestEnvelope;
+}
+
+function syncMutableCorpusRequest(): SyncMutableCorpusRequestEnvelope {
+  return {
+    type: "sync_mutable_corpus",
+    corpus_id: "proof-corpus",
+    snapshot: {
+      documents: [
+        {
+          document_id: "doc-alpha",
+          semantic_text: "alpha semantic body",
+          metadata: {
+            title: "alpha memo",
+            topic: "edge",
+          },
+        },
+      ],
+    },
+  } as unknown as SyncMutableCorpusRequestEnvelope;
+}
+
+function loadMutableCorpusRequest(): LoadMutableCorpusRequestEnvelope {
+  return {
+    type: "load_mutable_corpus",
+    corpus_id: "proof-corpus",
+  } as const;
+}
+
 function expectFailureState(state: SearchWorkerState): SearchWorkerState & { status: "failed" } {
   expect(state.status).toBe("failed");
   if (state.status !== "failed") {
@@ -156,6 +208,15 @@ layer(makeSearchHarnessLayer())("SearchWorkerClient worker crash handling", (it)
 
       const state = expectFailureState(yield* SubscriptionRef.get(client.state));
       expect(state.lastError.cause).toBe("worker_crashed");
+
+      const lateResult = yield* Effect.result(client.search(searchRequest()));
+      expect(lateResult._tag).toBe("Failure");
+      if (lateResult._tag !== "Failure") {
+        throw new Error("expected later search request to fail after worker crash");
+      }
+      expect(lateResult.failure._tag).toBe("TransientClientError");
+      expect(lateResult.failure.cause).toBe("worker_crashed");
+      expect(harness.fake.capturedRequests()).toHaveLength(1);
     }),
   );
 });
@@ -204,6 +265,7 @@ layer(makeSearchHarnessLayer())("SearchWorkerClient loaded index catalog", (it) 
     Effect.gen(function*() {
       const harness = yield* SearchHarness;
       const client = yield* SearchWorkerClient;
+      const metadataCatalog = yield* SearchMetadataCatalog;
 
       yield* waitForWorkerStart(harness.fake);
       harness.fake.dispatchReady();
@@ -229,12 +291,138 @@ layer(makeSearchHarnessLayer())("SearchWorkerClient loaded index catalog", (it) 
       const response = yield* Fiber.join(loadFiber);
       expect(response.type).toBe("index_loaded");
 
-      const loadedIndices = yield* SubscriptionRef.get(client.loadedIndices);
+      const loadedIndices = yield* SubscriptionRef.get(metadataCatalog.loadedIndices);
       const metadata = loadedIndices.get("proof-index");
       expect(metadata).toBeDefined();
       expect(metadata?.encoder).toEqual(proofEncoder());
       expect(metadata?.summary.dimension).toBe(4);
       expect(metadata?.source).toBe("load_index");
+    }),
+  );
+});
+
+layer(makeSearchHarnessLayer())("SearchWorkerClient mutable corpus catalog", (it) => {
+  it.effect("tracks register, sync, and reload state for mutable corpora", () =>
+    Effect.gen(function*() {
+      const harness = yield* SearchHarness;
+      const client = yield* SearchWorkerClient;
+      const metadataCatalog = yield* SearchMetadataCatalog;
+
+      yield* waitForWorkerStart(harness.fake);
+      harness.fake.dispatchReady();
+
+      const registerFiber = yield* client.registerMutableCorpus(registerMutableCorpusRequest()).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Effect.yieldNow;
+
+      const registerRequest =
+        harness.fake.capturedRequests<RegisterMutableCorpusRequestEnvelope>()[0];
+      expect(registerRequest).toBeDefined();
+      if (registerRequest === undefined) {
+        throw new Error("expected a captured register-mutable-corpus request");
+      }
+
+      harness.fake.dispatchEnvelope({
+        requestId: registerRequest.requestId,
+        ok: true,
+        response: {
+          type: "mutable_corpus_registered",
+          corpus_id: "proof-corpus",
+          created: true,
+          summary: mutableCorpusSummary(0),
+        },
+      });
+      yield* Effect.yieldNow;
+
+      const registerResponse = yield* Fiber.join(registerFiber);
+      expect(registerResponse.type).toBe("mutable_corpus_registered");
+
+      let mutableCorpora = yield* SubscriptionRef.get(metadataCatalog.mutableCorpora);
+      expect(mutableCorpora.get("proof-corpus")).toEqual({
+        corpusId: "proof-corpus",
+        summary: mutableCorpusSummary(0),
+        loaded: false,
+      });
+
+      harness.fake.clearOutbound();
+
+      const syncFiber = yield* client.syncMutableCorpus(syncMutableCorpusRequest()).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Effect.yieldNow;
+
+      const syncRequest =
+        harness.fake.capturedRequests<SyncMutableCorpusRequestEnvelope>()[0];
+      expect(syncRequest).toBeDefined();
+      if (syncRequest === undefined) {
+        throw new Error("expected a captured sync-mutable-corpus request");
+      }
+      expect(syncRequest.request.snapshot.documents).toHaveLength(1);
+
+      harness.fake.dispatchEnvelope({
+        requestId: syncRequest.requestId,
+        ok: true,
+        response: {
+          type: "mutable_corpus_synced",
+          corpus_id: "proof-corpus",
+          summary: mutableCorpusSummary(1),
+          sync: {
+            changed: true,
+            added: 1,
+            updated: 0,
+            deleted: 0,
+            unchanged: 0,
+          },
+        },
+      });
+      yield* Effect.yieldNow;
+
+      const syncResponse = yield* Fiber.join(syncFiber);
+      expect(syncResponse.type).toBe("mutable_corpus_synced");
+
+      mutableCorpora = yield* SubscriptionRef.get(metadataCatalog.mutableCorpora);
+      expect(mutableCorpora.get("proof-corpus")).toEqual({
+        corpusId: "proof-corpus",
+        summary: mutableCorpusSummary(1),
+        loaded: true,
+      });
+
+      harness.fake.clearOutbound();
+
+      const loadFiber = yield* client.loadMutableCorpus(loadMutableCorpusRequest()).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Effect.yieldNow;
+
+      const loadRequest =
+        harness.fake.capturedRequests<LoadMutableCorpusRequestEnvelope>()[0];
+      expect(loadRequest).toBeDefined();
+      if (loadRequest === undefined) {
+        throw new Error("expected a captured load-mutable-corpus request");
+      }
+      expect(loadRequest.request.corpus_id).toBe("proof-corpus");
+
+      harness.fake.dispatchEnvelope({
+        requestId: loadRequest.requestId,
+        ok: true,
+        response: {
+          type: "mutable_corpus_loaded",
+          corpus_id: "proof-corpus",
+          summary: mutableCorpusSummary(1),
+        },
+      });
+      yield* Effect.yieldNow;
+
+      const loadResponse = yield* Fiber.join(loadFiber);
+      expect(loadResponse.type).toBe("mutable_corpus_loaded");
+
+      mutableCorpora = yield* SubscriptionRef.get(metadataCatalog.mutableCorpora);
+      expect(mutableCorpora.get("proof-corpus")).toEqual({
+        corpusId: "proof-corpus",
+        summary: mutableCorpusSummary(1),
+        loaded: true,
+      });
     }),
   );
 });

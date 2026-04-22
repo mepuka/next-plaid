@@ -1,16 +1,22 @@
 import { Effect, Schema } from "effect";
 
 import type {
+  EncodeDocumentResponse,
   EncodeResponse,
   EncoderCreateInput,
   EncoderWorkerRequest,
 } from "./types.js";
+import {
+  EncoderIdentitySchema,
+  InlineQueryEmbeddingsPayloadSchema,
+  normalizeQueryEmbeddingsPayload,
+} from "../shared/search-contract-schema.js";
+import { DurableModelAssetStoreKindSchema, ModelAssetStoreKindSchema } from "./model-asset-store-schema.js";
 
-export const EncoderIdentitySchema = Schema.Struct({
-  encoder_id: Schema.String,
-  encoder_build: Schema.String,
-  embedding_dim: Schema.Number,
-  normalized: Schema.Boolean,
+export const MatrixPayloadSchema = Schema.Struct({
+  values: Schema.Array(Schema.Finite),
+  rows: Schema.Number,
+  dim: Schema.Number,
 });
 
 export const EncoderCapabilitiesSchema = Schema.Struct({
@@ -32,15 +38,14 @@ export const EncodeTimingBreakdownSchema = Schema.Struct({
 });
 
 export const EncodedQuerySchema = Schema.Struct({
-  payload: Schema.Struct({
-    embeddings: Schema.Array(Schema.Array(Schema.Number)),
-    encoder: EncoderIdentitySchema,
-    dtype: Schema.Literal("f32_le"),
-    layout: Schema.Union([
-      Schema.Literal("ragged"),
-      Schema.Literal("padded_query_length"),
-    ]),
-  }),
+  payload: InlineQueryEmbeddingsPayloadSchema,
+  timing: EncodeTimingBreakdownSchema,
+  input_ids: Schema.Array(Schema.Number),
+  attention_mask: Schema.Array(Schema.Number),
+});
+
+export const EncodedDocumentSchema = Schema.Struct({
+  payload: MatrixPayloadSchema,
   timing: EncodeTimingBreakdownSchema,
   input_ids: Schema.Array(Schema.Number),
   attention_mask: Schema.Array(Schema.Number),
@@ -67,16 +72,54 @@ export const EncodeResponseSchema = Schema.Struct({
   encoded: EncodedQuerySchema,
 });
 
+export const EncodeDocumentResponseSchema = Schema.Struct({
+  type: Schema.Literal("encoded_document"),
+  encoded: EncodedDocumentSchema,
+});
+
 export const EncoderInitEventSchema = Schema.Union([
   Schema.Struct({
-    stage: Schema.Literal("fetch_start"),
+    stage: Schema.Literal("asset_memory_hit"),
+    url: Schema.String,
+    bytesReceived: Schema.Number,
+  }),
+  Schema.Struct({
+    stage: Schema.Literal("asset_store_hit"),
+    url: Schema.String,
+    storeKind: ModelAssetStoreKindSchema,
+    bytesReceived: Schema.Number,
+  }),
+  Schema.Struct({
+    stage: Schema.Literal("asset_store_miss"),
+    url: Schema.String,
+    storeKind: ModelAssetStoreKindSchema,
+  }),
+  Schema.Struct({
+    stage: Schema.Literal("asset_store_write_start"),
+    url: Schema.String,
+    storeKind: DurableModelAssetStoreKindSchema,
+    bytesReceived: Schema.Number,
+  }),
+  Schema.Struct({
+    stage: Schema.Literal("asset_store_write_complete"),
+    url: Schema.String,
+    storeKind: DurableModelAssetStoreKindSchema,
+    bytesReceived: Schema.Number,
+  }),
+  Schema.Struct({
+    stage: Schema.Literal("asset_fetch_start"),
     url: Schema.String,
     expectedBytes: Schema.NullOr(Schema.Number),
   }),
   Schema.Struct({
-    stage: Schema.Literal("fetch_complete"),
+    stage: Schema.Literal("asset_fetch_complete"),
     url: Schema.String,
     bytesReceived: Schema.Number,
+  }),
+  Schema.Struct({
+    stage: Schema.Literal("config_validated"),
+    queryLength: Schema.Number,
+    embeddingDim: Schema.Number,
   }),
   Schema.Struct({
     stage: Schema.Literal("session_create_start"),
@@ -107,7 +150,13 @@ export const EncoderWorkerRequestSchema = Schema.Union([
     type: Schema.Literal("health"),
   }),
   Schema.Struct({
-    type: Schema.Literal("encode"),
+    type: Schema.Literal("encode_query"),
+    payload: Schema.Struct({
+      text: Schema.String,
+    }),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("encode_document"),
     payload: Schema.Struct({
       text: Schema.String,
     }),
@@ -116,6 +165,13 @@ export const EncoderWorkerRequestSchema = Schema.Union([
     type: Schema.Literal("dispose"),
   }),
 ]);
+
+export const isEncodedQuery = Schema.is(EncodedQuerySchema);
+export const isEncoderWorkerRequest = Schema.is(EncoderWorkerRequestSchema);
+export const isEncoderInitResponse = Schema.is(EncoderInitResponseSchema);
+export const isEncodeResponse = Schema.is(EncodeResponseSchema);
+export const isEncodeDocumentResponse = Schema.is(EncodeDocumentResponseSchema);
+export const isEncoderInitEvent = Schema.is(EncoderInitEventSchema);
 
 function normalizeEncoderCreateInput(
   input: Schema.Schema.Type<typeof EncoderCreateInputSchema>,
@@ -144,11 +200,28 @@ function normalizeEncodeResponse(
   return {
     type: response.type,
     encoded: {
+      payload: normalizeQueryEmbeddingsPayload(response.encoded.payload),
+      timing: {
+        total_ms: response.encoded.timing.total_ms,
+        tokenize_ms: response.encoded.timing.tokenize_ms,
+        inference_ms: response.encoded.timing.inference_ms,
+      },
+      input_ids: [...response.encoded.input_ids],
+      attention_mask: [...response.encoded.attention_mask],
+    },
+  };
+}
+
+function normalizeEncodeDocumentResponse(
+  response: Schema.Schema.Type<typeof EncodeDocumentResponseSchema>,
+): EncodeDocumentResponse {
+  return {
+    type: response.type,
+    encoded: {
       payload: {
-        embeddings: response.encoded.payload.embeddings.map((row) => [...row]),
-        encoder: response.encoded.payload.encoder,
-        dtype: response.encoded.payload.dtype,
-        layout: response.encoded.payload.layout,
+        values: [...response.encoded.payload.values],
+        rows: response.encoded.payload.rows,
+        dim: response.encoded.payload.dim,
       },
       timing: {
         total_ms: response.encoded.timing.total_ms,
@@ -190,6 +263,13 @@ export const decodeEncodeResponseSchema = (
 ): Effect.Effect<EncodeResponse, unknown> =>
   Schema.decodeUnknownEffect(EncodeResponseSchema)(value).pipe(
     Effect.map(normalizeEncodeResponse),
+  );
+
+export const decodeEncodeDocumentResponseSchema = (
+  value: unknown,
+): Effect.Effect<EncodeDocumentResponse, unknown> =>
+  Schema.decodeUnknownEffect(EncodeDocumentResponseSchema)(value).pipe(
+    Effect.map(normalizeEncodeDocumentResponse),
   );
 
 export const decodeEncoderInitEventSchema = Schema.decodeUnknownEffect(
